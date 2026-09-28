@@ -3,6 +3,10 @@
 //! The config location is redirected into a scratch tree, so the user's own config and playlists are
 //! untouched. All tests in this binary use the same redirect, and each writes the config it needs
 //! before building the application, so they are run one at a time.
+//!
+//! The socket is redirected too. Building an application starts a playback daemon when none is
+//! running, and a test that reached for the machine's own player would drive whatever the user is
+//! listening to — and then see its queue rather than the empty one it expects.
 
 mod common;
 
@@ -10,14 +14,20 @@ use std::path::{Path, PathBuf};
 
 use ogma::app::{App, ScreenKind};
 use ogma::config::Config;
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
 /// Point the config at a scratch tree and return where the config file now lives.
 fn redirect() -> PathBuf {
     let root = std::env::temp_dir().join("ogma-app-start");
 
-    // SAFETY: every test in this binary sets the same value; they are run single-threaded.
-    unsafe { std::env::set_var("XDG_CONFIG_HOME", &root) };
+    // SAFETY: every test in this binary sets the same values; they are run single-threaded.
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", &root);
+        // Kept short and directly in /tmp: a Unix socket's path has a hard length limit.
+        std::env::set_var("OGMA_SOCKET", format!("/tmp/ogma-t-app-{}.sock", std::process::id()));
+    }
 
     let path = Config::config_path().expect("a config path");
     if let Some(parent) = path.parent() {
@@ -43,6 +53,28 @@ fn music(name: &str) -> PathBuf {
     );
 
     dir
+}
+
+/// What the application draws, as text.
+fn frame_of(app: &mut App) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(140, 30)).expect("test terminal");
+
+    terminal.draw(|frame| app.draw(frame)).expect("draw");
+
+    let buffer = terminal.backend().buffer();
+    let width = buffer.area.width as usize;
+
+    buffer
+        .content()
+        .chunks(width)
+        .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Press a key, for the sequences that only care about the effect.
+fn press(app: &mut App, code: KeyCode) {
+    app.handle_key(KeyEvent::from(code));
 }
 
 /// Write `config` to the redirected location.
@@ -128,9 +160,55 @@ fn where_the_application_starts_and_how_it_comes_back() {
         "and came back where it was, rather than at the library root"
     );
 
+    // --- a setting changed in the config reaches the player that was set aside ---
+    assert!(frame_of(&mut app).contains("+/-"), "the keys start out listed");
+
+    // To the menu, down to Open Config, and in.
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.screen(), ScreenKind::Config);
+
+    // Down to Control hints, and off.
+    for _ in 0..4 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+    assert!(!app.config().show_control_hints(), "the setting is off");
+
+    // Out of the config and back into the player that was waiting.
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.screen(), ScreenKind::Play);
+
+    let frame = frame_of(&mut app);
+    assert!(!frame.contains("+/-"), "the transport keys went with the setting: {frame}");
+    assert!(!frame.contains("a queue"), "and so did the panes': {frame}");
+    assert!(frame.contains("Queue"), "what is not a hint stays: {frame}");
+
+    // And back on again, without reopening the library.
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    for _ in 0..4 {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Enter);
+
+    assert!(app.config().show_control_hints());
+    assert!(frame_of(&mut app).contains("+/-"), "the keys are listed again");
+
     // --- a folder that has since gone away: back to the menu ---
     std::fs::remove_dir_all(&folder).expect("remove folder");
 
     let app = App::new();
     assert_eq!(app.screen(), ScreenKind::Start, "the menu can point it somewhere else");
+
+    // The daemon this test started is this test's to stop: nothing of its own is left playing, and
+    // the next run finds a socket with nobody on it, as it expects.
+    let _ = ogma::ipc::send(&ogma::ipc::Command::Quit);
 }

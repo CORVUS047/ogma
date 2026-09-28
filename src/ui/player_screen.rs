@@ -358,6 +358,11 @@ impl PlayerScreen {
                 Line::from("Nothing playing").style(self.theme.muted()).centered(),
                 centered_row(title_area),
             );
+
+            // The volume and the keys are worth showing with nothing playing: the fader is what the
+            // next song will come out at, and this is where someone looks to find out how to move it.
+            self.render_transport(frame, transport_area, player, None);
+
             return;
         };
 
@@ -388,16 +393,19 @@ impl PlayerScreen {
 
         frame.render_widget(ratatui::widgets::Paragraph::new(lines), title_area);
 
-        self.render_transport(frame, transport_area, player, song);
+        self.render_transport(frame, transport_area, player, Some(song));
     }
 
     /// The progress bar, the clock, and what the player is doing.
+    ///
+    /// Without a song there is no progress to draw, but the volume and the keys are still worth the
+    /// rows: they say what the player will do next, not what it is doing.
     fn render_transport(
         &self,
         frame: &mut Frame<'_>,
         area: Rect,
         player: &Player,
-        song: &Song,
+        song: Option<&Song>,
     ) {
         let [bar_area, state_area, keys_area] = Layout::vertical([
             Constraint::Length(1),
@@ -406,23 +414,25 @@ impl PlayerScreen {
         ])
         .areas(area);
 
-        let elapsed = format_time(player.position());
-        let total = song.display_duration();
+        if let Some(song) = song {
+            let elapsed = format_time(player.position());
+            let total = song.display_duration();
 
-        // Both clocks and the spaces around the bar have to fit, or the line gets clipped.
-        let clocks = elapsed.chars().count() + total.chars().count() + 2;
-        let cells = (bar_area.width as usize).saturating_sub(clocks);
-        let progress = bar(player.progress().unwrap_or(0.0), cells);
+            // Both clocks and the spaces around the bar have to fit, or the line gets clipped.
+            let clocks = elapsed.chars().count() + total.chars().count() + 2;
+            let cells = (bar_area.width as usize).saturating_sub(clocks);
+            let progress = bar(player.progress().unwrap_or(0.0), cells);
 
-        frame.render_widget(
-            Line::from(vec![
-                Span::from(format!("{elapsed} ")).style(self.theme.text()),
-                Span::from(progress).style(self.theme.accent()),
-                Span::from(format!(" {total}")).style(self.theme.text()),
-            ])
-            .centered(),
-            bar_area,
-        );
+            frame.render_widget(
+                Line::from(vec![
+                    Span::from(format!("{elapsed} ")).style(self.theme.text()),
+                    Span::from(progress).style(self.theme.accent()),
+                    Span::from(format!(" {total}")).style(self.theme.text()),
+                ])
+                .centered(),
+                bar_area,
+            );
+        }
 
         // A filled triangle and a square are in almost every font; the media-control pause and stop
         // glyphs are not, so the pause marker is drawn with plain pipes.
@@ -497,20 +507,23 @@ impl PlayerScreen {
 
         frame.render_widget(Line::from(state_line).centered(), state_area);
 
-        // Three spellings, so a narrow pane shows a shorter reminder rather than a clipped one. The
+        // Four spellings, so a narrow pane shows a shorter reminder rather than a clipped one. The
         // keys are named in words, since the media-control glyphs are missing from many terminal
-        // fonts.
-        const LONG: &str =
-            "space play/pause · n/p track · left/right seek · z shuffle · tab pane · q back";
-        const MEDIUM: &str = "space pause · n/p track · z shuffle · q back";
-        const SHORT: &str = "space pause · n/p · q";
+        // fonts. The volume keys survive into every spelling: the bar above says where the fader is,
+        // and without them nothing on screen says how to move it.
+        const LONG: &str = "space play/pause · n/p track · left/right seek · +/- volume · \
+                            z shuffle · S stop · tab pane · q back";
+        const MEDIUM: &str =
+            "space pause · n/p track · left/right seek · +/- volume · z shuffle · q back";
+        const SHORT: &str = "space pause · n/p track · +/- volume · q back";
+        const TINY: &str = "space · n/p · +/- vol · q";
 
         if !self.hints {
             return;
         }
 
         let room = keys_area.width as usize;
-        let keys = [LONG, MEDIUM, SHORT]
+        let keys = [LONG, MEDIUM, SHORT, TINY]
             .into_iter()
             .find(|candidate| candidate.chars().count() <= room)
             .unwrap_or("");

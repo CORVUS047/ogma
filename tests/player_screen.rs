@@ -404,6 +404,48 @@ fn the_key_reminders_can_be_turned_off() {
 }
 
 #[test]
+fn the_volume_is_on_screen_along_with_the_keys_that_move_it() {
+    /// Wide enough for the fader's full reading, which a narrow pane gives up before the bar.
+    fn wide_frame_of(screen: &mut PlayerScreen, player: &Player) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).expect("test terminal");
+
+        terminal.draw(|f| screen.render(f, f.area(), player)).expect("draw player screen");
+
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+
+        buffer
+            .content()
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    let mut screen = isolated_screen();
+
+    // Nothing playing is no reason to hide the fader: it is what the next song comes out at, and
+    // guessing where it sits is what having it on screen avoids.
+    let frame = wide_frame_of(&mut screen, &Player::new());
+    assert!(frame.contains("Nothing playing"));
+    assert!(frame.contains("vol"), "the fader is labelled: {frame}");
+    assert!(frame.contains("50%"), "and reads where it sits: {frame}");
+    assert!(frame.contains("+/-"), "with the keys that move it named: {frame}");
+
+    // And with something playing, where the progress bar shares the space.
+    let player = playing();
+    let frame = wide_frame_of(&mut screen, &player);
+    assert!(frame.contains("50%"), "{frame}");
+    assert!(frame.contains("+/-"), "{frame}");
+
+    // Hidden hints take the reminder, not the reading: the level is state, not a hint.
+    screen.set_hints(false);
+    let frame = wide_frame_of(&mut screen, &player);
+    assert!(!frame.contains("+/-"), "{frame}");
+    assert!(frame.contains("50%"), "{frame}");
+}
+
+#[test]
 fn the_queue_only_says_it_is_empty_when_there_is_nothing_at_all() {
     let mut screen = isolated_screen();
 

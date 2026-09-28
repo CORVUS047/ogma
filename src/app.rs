@@ -230,7 +230,11 @@ impl App {
         self.fills = None;
     }
 
-    fn draw(&mut self, frame: &mut Frame<'_>) {
+    /// Draw whichever screen is showing.
+    ///
+    /// Public so the interface can be drawn without a terminal of its own, which is how the screens
+    /// are tested.
+    pub fn draw(&mut self, frame: &mut Frame<'_>) {
         let area = frame.area();
 
         match &mut self.screen {
@@ -257,6 +261,10 @@ impl App {
                 if let Some(ConfigMenuOutcome::Close) = menu.handle_key(key, &mut self.config) {
                     // The config may now name a different folder to open next time.
                     self.library_root = self.config.default_folder().map(PathBuf::from);
+
+                    // Settings that need no restart are pushed into the screens that already exist,
+                    // so the player waiting behind Continue shows what the config now says.
+                    self.apply_config();
                     self.screen = self.start_menu();
                 }
             }
@@ -274,6 +282,35 @@ impl App {
                     self.suspend_player();
                 }
             }
+        }
+    }
+
+    /// Push the settings that take effect at once into the screens that already exist.
+    ///
+    /// A screen is dressed from the config when it is built, which is enough for the ones built on
+    /// the way out of the config screen. The player screen set aside by Continue is not rebuilt —
+    /// that is the point of it — so without this, hints or messages turned on or off would not reach
+    /// it or its panes until the library was opened again.
+    fn apply_config(&mut self) {
+        let hints = self.config.show_control_hints();
+        let messages = !self.config.hide_status_messages();
+
+        if let Some(screen) = self.suspended.as_mut() {
+            screen.set_hints(hints);
+            screen.set_messages(messages);
+        }
+
+        match &mut self.screen {
+            Screen::Play(screen) => {
+                screen.set_hints(hints);
+                screen.set_messages(messages);
+            }
+            Screen::Start(menu) => menu.set_hints(hints),
+            Screen::Browse(browser) => {
+                browser.set_hints(hints);
+                browser.set_messages(messages);
+            }
+            Screen::Config(menu) => menu.set_messages(messages),
         }
     }
 
