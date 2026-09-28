@@ -124,6 +124,7 @@ impl Command {
             "clear" => Ok(Command::Clear),
             "queue_clear" => Ok(Command::QueueClear),
             "quit" => Ok(Command::Quit),
+            "close" => Ok(Command::Quit),
             "queue_add" => Ok(Command::QueueAdd(PathBuf::from(needs_name("queue_add")?))),
             "queue_add_folder" => {
                 Ok(Command::QueueAddFolder(PathBuf::from(needs_name("queue_add_folder")?)))
@@ -214,7 +215,7 @@ impl Command {
             ("stop", "halt playback and rewind, keeping the queue"),
             ("clear", "stop and forget the queue and history"),
             ("status", "report what is playing, as JSON"),
-            ("quit", "ask the daemon to finish"),
+            ("quit/close", "kill the daemon"),
         ]
     }
 }

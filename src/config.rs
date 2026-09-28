@@ -145,9 +145,9 @@ impl DaemonOnClose {
     /// A name for the interface.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Stop => "stop it",
-            Self::StopIfWeStartedIt => "stop if we started it",
-            Self::Keep => "keep playing",
+            Self::Stop => "kill daemon",
+            Self::StopIfWeStartedIt => "keep daemon if already running",
+            Self::Keep => "keep daemon",
         }
     }
 

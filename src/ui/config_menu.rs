@@ -63,7 +63,7 @@ impl Field {
             Self::FetchArtworkOnline => "enter toggle · sends artist and album to services",
             Self::ShowControlHints => "enter toggle · lists the keys on each screen",
             Self::HideStatusMessages => "enter toggle · silences what an action reports",
-            Self::DaemonOnClose => "enter cycles · what happens to playback when you leave",
+            Self::DaemonOnClose => "enter cycles · what happens to playback when closed",
             Self::CustomTheme => "enter toggle · colours from theme.toml, restart to apply",
         }
     }
