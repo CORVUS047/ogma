@@ -92,12 +92,36 @@ Nothing is queued on open. The queue is yours to fill from the file listing.
 
 **Continue** only appears once there is a player screen to go back to.
 
+#### Folder browser
+
+Where **Select Folder** goes. It chooses the folder it is *listing*, not the one highlighted, so walk
+into a folder before selecting it — the title says which one `s` would take.
+
+| Key | Does |
+| --- | --- |
+| enter, right, `l` | Into the highlighted folder |
+| left, `h`, backspace | Up a folder |
+| `s`, space | Use the listed folder as the library |
+| `~` | Jump to your home folder |
+| `.` | Show or hide dotfolders |
+| `/` | Find in the listing; esc clears it |
+| `j` `k` `g` `G`, page up / down | Move |
+| `q`, esc | Back to the menu, changing nothing |
+
+The choice is written to the config as soon as it is made, so there is nothing to save.
+
 #### Player:
 
 <img width="1856" height="1044" alt="image" src="https://github.com/user-attachments/assets/5d1bfd9a-3bd3-497f-8ec2-59069393a056" />
 
 Three panes — playlists, files, queue — with cover art and the progress of what is playing. `tab`
 moves the focus; the keys below work wherever the focus is.
+
+Under the progress bar is what the player is doing and where the fader sits — `▶ playing  vol
+█████░░░░░  50%  -10.0 dB`. It stays on screen with nothing playing, since that is the level the next
+song comes out at. A narrow pane gives up the bar's cells and then the percentage to keep
+the decibel reading, which is the part that cannot be guessed, and only falls back to the percentage
+alone when even a four-cell bar and the reading will not fit. Nothing is ever clipped.
 
 Playback:
 
@@ -172,8 +196,8 @@ start rather than stopping, since there is always a next song.
 | Default folder | The folder the library is built from. `enter` types a path, `d` clears it |
 | Fill metadata | Writes missing artwork into your music files. **Off by default — it modifies your files** |
 | Look online | Lets the filling ask MusicBrainz and iTunes instead of only reading the disk. Off by default, and separate from the above on purpose. Needs Fill metadata on |
-| Control hints | Whether the keys are listed on each screen. On by default |
-| Hide messages | Silences what an action reports. The failures share that line, so turning it on hides those too |
+| Control hints | Whether the keys are listed on each screen. On by default, and applies as soon as the config is left — the player waiting behind Continue included |
+| Hide messages | Silences what an action reports. The failures share that line, so turning it on hides those too. Applies straight away, like the hints |
 | On close | What becomes of the daemon when the **last** interface closes: keep it if it was started by hand (default), always kill it, or always keep it. Closing one of several interfaces never stops playback — see [Several interfaces at once](#several-interfaces-at-once) |
 | Theme | Colours from `theme.toml` instead of the terminal's palette. Restart to apply |
 
