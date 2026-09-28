@@ -7,12 +7,13 @@
 //!
 //! Both `ogma-cmd` and the terminal interface are clients of this.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::audio::AudioEngine;
 use crate::config::Config;
-use crate::ipc::{self, Command, Status};
+use crate::ipc::{self, Command, OnLeave, Status};
 use crate::library;
 use crate::player::{PlaybackState, Player};
 use crate::playlist::Playlist;
@@ -35,6 +36,17 @@ pub struct Daemon {
     audio_error: Option<String>,
     /// Where a song named on the command line is looked for.
     library_root: Option<std::path::PathBuf>,
+    /// The interfaces currently driving this daemon, by the id each attached under.
+    ///
+    /// What keeps the music on when one of several interfaces closes: a leaving interface can ask for
+    /// the daemon to stop, and is only listened to once this is empty.
+    interfaces: HashSet<String>,
+    /// Whether an interface is what started this daemon, rather than it having been started by hand.
+    ///
+    /// Any interface that says so on attaching sets this, and it is never unset: a daemon spawned for
+    /// an interface is still a daemon spawned for an interface after that interface has gone, and
+    /// whichever one leaves last is the one that has to close it.
+    spawned_by_interface: bool,
     running: bool,
 }
 
@@ -44,6 +56,7 @@ impl std::fmt::Debug for Daemon {
             .field("queued", &self.player.queue().len())
             .field("state", &self.player.state())
             .field("audio", &self.audio.is_some())
+            .field("interfaces", &self.interfaces.len())
             .finish()
     }
 }
@@ -55,20 +68,25 @@ impl Default for Daemon {
 }
 
 impl Daemon {
-    /// Open the audio device and take the volume and library from the config.
+    /// Open the audio device and take the volume and library from the config on disk.
     pub fn new() -> Self {
-        let config = Config::load();
+        Self::with_config(&Config::load())
+    }
 
+    /// [`Daemon::new`], from a config the caller already has rather than the one on disk.
+    pub fn with_config(config: &Config) -> Self {
         let (audio, audio_error) = match AudioEngine::new(*config.get_master_volume()) {
             Ok(engine) => (Some(engine), None),
             Err(err) => (None, Some(err.to_string())),
         };
 
         Daemon {
-            player: Player::with_config(&config),
+            player: Player::with_config(config),
             audio,
             audio_error,
             library_root: config.default_folder().map(Path::to_path_buf),
+            interfaces: HashSet::new(),
+            spawned_by_interface: false,
             running: true,
         }
     }
@@ -316,7 +334,44 @@ impl Daemon {
 
                 "ok: finishing".to_string()
             }
+
+            // --- interfaces arriving and leaving ---
+            Command::Attach { id, spawned } => {
+                self.interfaces.insert(id);
+                self.spawned_by_interface |= spawned;
+
+                format!("ok: attached · {}", count(self.interfaces.len()))
+            }
+            Command::Leave { id, on_leave } => {
+                self.interfaces.remove(&id);
+
+                // Whatever the leaving interface would like, an interface that is still here is
+                // listening to this daemon play, and that is not the leaving one's to end.
+                if !self.interfaces.is_empty() {
+                    return format!("ok: left · {}", count(self.interfaces.len()));
+                }
+
+                let stop = match on_leave {
+                    OnLeave::Keep => false,
+                    OnLeave::Stop => true,
+                    OnLeave::StopIfSpawned => self.spawned_by_interface,
+                };
+
+                if stop {
+                    self.running = false;
+
+                    "ok: left · finishing".to_string()
+                } else {
+                    "ok: left · no interfaces".to_string()
+                }
+            }
+            Command::Interfaces => format!("ok: {}", count(self.interfaces.len())),
         }
+    }
+
+    /// How many interfaces are attached.
+    pub fn interfaces(&self) -> usize {
+        self.interfaces.len()
     }
 
     /// What is playing, for the replies that report it.
@@ -407,6 +462,14 @@ fn find_playlist(name: &str) -> Option<Playlist> {
             playlists.iter().find(|playlist| playlist.name().to_lowercase().contains(&wanted))
         })
         .cloned()
+}
+
+/// `1 interface` or `2 interfaces`, for the replies that report how many are attached.
+fn count(interfaces: usize) -> String {
+    match interfaces {
+        1 => "1 interface".to_string(),
+        other => format!("{other} interfaces"),
+    }
 }
 
 /// `m:ss`, for the replies that mention a position.

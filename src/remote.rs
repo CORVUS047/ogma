@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use crate::ipc::{self, Command, Status};
+use crate::ipc::{self, Attachment, Command, OnLeave, Status};
 use crate::player::{Controls, PlaybackState, Player};
 use crate::playlist::Playlist;
 use crate::song::Song;
@@ -22,6 +22,11 @@ pub struct Remote {
     connected: bool,
     /// Why the daemon could not be reached, if it could not.
     error: Option<String>,
+    /// The held connection that has this interface counted among the daemon's.
+    ///
+    /// Held for as long as the interface runs: the daemon takes its closing as this interface having
+    /// gone, which is what keeps a crashed interface from holding a daemon open forever.
+    attachment: Option<Attachment>,
 }
 
 impl Default for Remote {
@@ -32,7 +37,53 @@ impl Default for Remote {
 
 impl Remote {
     pub fn new() -> Self {
-        Remote { mirror: Player::new(), connected: false, error: None }
+        Remote { mirror: Player::new(), connected: false, error: None, attachment: None }
+    }
+
+    /// Tell the daemon this interface is here, so it knows not to stop while it is.
+    ///
+    /// `spawned` says whether this process is what started the daemon; the daemon remembers that
+    /// rather than each interface, so whichever interface leaves last is the one that closes it.
+    pub fn attach(&mut self, spawned: bool) {
+        match ipc::attach(spawned) {
+            Ok(attachment) => {
+                self.attachment = Some(attachment);
+                self.connected = true;
+                self.error = None;
+            }
+            Err(err) => {
+                self.connected = false;
+                self.error = Some(err);
+            }
+        }
+    }
+
+    /// Whether the daemon is counting this interface.
+    pub fn attached(&self) -> bool {
+        self.attachment.is_some()
+    }
+
+    /// Say this interface has gone, asking for the daemon to stop if nothing else needs it.
+    ///
+    /// The daemon answers, since only it knows how many interfaces are left; `None` means this
+    /// interface was never attached, so nobody was counting and the caller has to decide for itself.
+    pub fn leave(&mut self, on_leave: OnLeave) -> Option<String> {
+        let attachment = self.attachment.take()?;
+
+        match attachment.leave(on_leave) {
+            Ok(reply) => {
+                self.connected = true;
+                self.error = None;
+
+                Some(reply)
+            }
+            Err(err) => {
+                self.connected = false;
+                self.error = Some(err);
+
+                None
+            }
+        }
     }
 
     /// What the daemon is doing, as far as the last status said.
@@ -106,7 +157,10 @@ impl Remote {
         }
     }
 
-    /// Ask the daemon to finish.
+    /// Ask the daemon to finish, whoever else is attached.
+    ///
+    /// [`Remote::leave`] is what closing an interface uses; this is the blunt version, for a caller
+    /// that means it.
     pub fn quit_daemon(&mut self) {
         self.send(Command::Quit);
     }

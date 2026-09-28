@@ -124,13 +124,19 @@ fn yes() -> bool {
 ///
 /// The daemon keeps playing without an interface, which is the point of it; the question is only
 /// whether closing the interface should end that.
+///
+/// None of these stop a daemon another interface is still driving: with two interfaces open, closing
+/// one leaves the music playing whatever this says. The choice is about the last one to close.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DaemonOnClose {
-    /// Always stop the daemon, so nothing is left playing.
+    /// Always stop the daemon once the last interface has closed, so nothing is left playing.
     Stop,
-    /// Stop it only if this interface was what started it, leaving a daemon that was already running
-    /// to carry on. The default: closing the interface undoes what opening it did, and nothing more.
+    /// Stop it only if an interface was what started it, leaving a daemon that was started by hand to
+    /// carry on. The default: closing the interfaces undoes what opening one did, and nothing more.
+    ///
+    /// Which interface started it does not matter, only that one did: the daemon remembers that, so
+    /// whichever interface closes last is the one that stops it.
     #[default]
     StopIfWeStartedIt,
     /// Leave it running, playing on without an interface.
@@ -154,8 +160,8 @@ impl DaemonOnClose {
     /// What this choice means, spelled out.
     pub fn describe(self) -> &'static str {
         match self {
-            Self::Stop => "closing always stops playback",
-            Self::StopIfWeStartedIt => "a daemon that was already running keeps playing",
+            Self::Stop => "closing the last interface stops playback",
+            Self::StopIfWeStartedIt => "a daemon started by hand keeps playing",
             Self::Keep => "playback carries on without the interface",
         }
     }

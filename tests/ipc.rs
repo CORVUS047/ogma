@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use ogma::config::Config;
 use ogma::daemon::Daemon;
-use ogma::ipc::{self, Command, Server};
+use ogma::ipc::{self, Command, OnLeave, Server};
 use ogma::playlist::Playlist;
 
 /// A short, unique socket path, removed if something left one behind.
@@ -135,6 +135,144 @@ fn a_client_with_nobody_to_talk_to_says_so() {
 
     assert!(err.contains("no player listening"), "{err}");
     assert!(err.contains(&path.display().to_string()), "and says where it looked: {err}");
+}
+
+// -------------------------------------------------------------- interfaces coming and going
+
+#[test]
+fn an_interface_attaches_over_a_connection_it_then_holds_open() {
+    let path = socket("attach");
+    let server = Server::start_at(path.clone()).expect("listen");
+
+    // Attaching is answered like any command; the connection it came on stays open afterwards.
+    let attaching = std::thread::spawn({
+        let path = path.clone();
+        move || ipc::attach_to(&path, true)
+    });
+
+    let seen = answer_for(&server, "ok: attached · 1 interface", Duration::from_secs(5));
+    let attachment = attaching.join().expect("joined").expect("attached");
+
+    assert_eq!(
+        seen,
+        [Command::Attach { id: attachment.id().to_string(), spawned: true }],
+        "the player was told an interface is here, and that it started this daemon"
+    );
+
+    // Saying goodbye carries what the interface would like done, which is the player's to act on.
+    let leaving = std::thread::spawn({
+        let path = path.clone();
+        let id = attachment.id().to_string();
+        move || ipc::send_to(&path, &Command::Leave { id, on_leave: OnLeave::StopIfSpawned })
+    });
+
+    let seen = answer_for(&server, "ok: left · finishing", Duration::from_secs(5));
+    assert_eq!(
+        seen,
+        [Command::Leave {
+            id: attachment.id().to_string(),
+            on_leave: OnLeave::StopIfSpawned
+        }]
+    );
+    assert_eq!(leaving.join().expect("joined").expect("an answer"), "ok: left · finishing");
+}
+
+#[test]
+fn an_interface_that_vanishes_without_a_word_is_still_heard_leaving() {
+    let path = socket("attach-vanish");
+    let server = Server::start_at(path.clone()).expect("listen");
+
+    let attaching = std::thread::spawn({
+        let path = path.clone();
+        move || ipc::attach_to(&path, false)
+    });
+
+    answer_for(&server, "ok: attached · 1 interface", Duration::from_secs(5));
+    let attachment = attaching.join().expect("joined").expect("attached");
+    let id = attachment.id().to_string();
+
+    // What a killed interface does: the connection ends with nothing said on it.
+    drop(attachment);
+
+    let seen = answer_for(&server, "ok: left · no interfaces", Duration::from_secs(5));
+
+    assert_eq!(
+        seen,
+        [Command::Leave { id, on_leave: OnLeave::Keep }],
+        "gone, and asking for nothing: an interface that crashed did not ask for the music to stop"
+    );
+}
+
+#[test]
+fn a_daemon_another_interface_is_driving_is_not_one_interface_to_stop() {
+    let mut daemon = Daemon::with_config(&Config::default());
+
+    assert_eq!(daemon.apply(Command::Interfaces), "ok: 0 interfaces");
+
+    let reply = daemon.apply(Command::Attach { id: "one".to_string(), spawned: true });
+    assert_eq!(reply, "ok: attached · 1 interface");
+
+    let reply = daemon.apply(Command::Attach { id: "two".to_string(), spawned: false });
+    assert_eq!(reply, "ok: attached · 2 interfaces");
+
+    // The interface that started the daemon closes, asking for it to go too. The other is still
+    // listening to it, so it stays.
+    let reply =
+        daemon.apply(Command::Leave { id: "one".to_string(), on_leave: OnLeave::StopIfSpawned });
+    assert_eq!(reply, "ok: left · 1 interface");
+    assert!(daemon.is_running(), "the other interface is still driving it");
+
+    // Not even a flat stop is acted on while somebody is attached.
+    daemon.apply(Command::Attach { id: "three".to_string(), spawned: false });
+    let reply = daemon.apply(Command::Leave { id: "two".to_string(), on_leave: OnLeave::Stop });
+    assert_eq!(reply, "ok: left · 1 interface");
+    assert!(daemon.is_running(), "closing one of two interfaces does not stop the music");
+    assert_eq!(daemon.interfaces(), 1);
+
+    // The last one out is the one it follows. An interface started this daemon, so it finishes.
+    let reply =
+        daemon.apply(Command::Leave { id: "three".to_string(), on_leave: OnLeave::StopIfSpawned });
+    assert_eq!(reply, "ok: left · finishing");
+    assert!(!daemon.is_running());
+    assert_eq!(daemon.interfaces(), 0);
+}
+
+#[test]
+fn the_last_interface_out_is_the_one_the_daemon_listens_to() {
+    // Started by hand: the interfaces that came and went are not what it exists for.
+    let mut daemon = Daemon::with_config(&Config::default());
+    daemon.apply(Command::Attach { id: "one".to_string(), spawned: false });
+
+    let reply =
+        daemon.apply(Command::Leave { id: "one".to_string(), on_leave: OnLeave::StopIfSpawned });
+    assert_eq!(reply, "ok: left · no interfaces");
+    assert!(daemon.is_running(), "a daemon started by hand outlives the interfaces driving it");
+
+    // Asked to be left alone, it is, whoever started it.
+    let mut daemon = Daemon::with_config(&Config::default());
+    daemon.apply(Command::Attach { id: "one".to_string(), spawned: true });
+    assert_eq!(
+        daemon.apply(Command::Leave { id: "one".to_string(), on_leave: OnLeave::Keep }),
+        "ok: left · no interfaces"
+    );
+    assert!(daemon.is_running());
+
+    // Asked to stop, it stops.
+    let mut daemon = Daemon::with_config(&Config::default());
+    daemon.apply(Command::Attach { id: "one".to_string(), spawned: false });
+    assert_eq!(
+        daemon.apply(Command::Leave { id: "one".to_string(), on_leave: OnLeave::Stop }),
+        "ok: left · finishing"
+    );
+    assert!(!daemon.is_running());
+
+    // And a leaving id nobody attached under changes nothing.
+    let mut daemon = Daemon::with_config(&Config::default());
+    daemon.apply(Command::Attach { id: "here".to_string(), spawned: true });
+    let reply =
+        daemon.apply(Command::Leave { id: "elsewhere".to_string(), on_leave: OnLeave::Stop });
+    assert_eq!(reply, "ok: left · 1 interface");
+    assert!(daemon.is_running(), "the interface that is here still needs it");
 }
 
 // ------------------------------------------------------- what the player makes of each command

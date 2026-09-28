@@ -9,6 +9,7 @@ use ratatui::{DefaultTerminal, Frame};
 
 use crate::autofill;
 use crate::config::{Config, DaemonOnClose};
+use crate::ipc::OnLeave;
 use crate::daemon;
 use crate::library;
 use crate::remote::Remote;
@@ -96,6 +97,10 @@ impl Default for App {
         }
 
         let mut remote = Remote::new();
+
+        // Being counted among the daemon's interfaces is what keeps it playing when one of several
+        // interfaces closes. It is told who started it, so the last one out is the one that closes it.
+        remote.attach(started_daemon);
         remote.refresh();
 
         let theme = Theme::load(config.custom_theme());
@@ -164,7 +169,22 @@ impl App {
     }
 
     /// Do with the daemon whatever the config asks for on close.
+    ///
+    /// The wish goes to the daemon rather than being acted on here: another interface may still be
+    /// driving it, and a daemon somebody else is still listening to is not this interface's to stop.
     fn part_with_daemon(&mut self) {
+        let on_leave = match self.config.daemon_on_close() {
+            DaemonOnClose::Stop => OnLeave::Stop,
+            DaemonOnClose::StopIfWeStartedIt => OnLeave::StopIfSpawned,
+            DaemonOnClose::Keep => OnLeave::Keep,
+        };
+
+        if self.remote.leave(on_leave).is_some() {
+            return;
+        }
+
+        // Attaching never worked, so nothing is counting interfaces and the old answer is the best
+        // one available: stop it if this interface is what started it.
         let stop = match self.config.daemon_on_close() {
             DaemonOnClose::Stop => true,
             DaemonOnClose::StopIfWeStartedIt => self.started_daemon,

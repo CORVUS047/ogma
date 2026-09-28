@@ -11,12 +11,17 @@
 //!
 //! The socket lives in the runtime directory, which is cleared on reboot, so a socket left behind by
 //! a crash cannot outlive the session for long. A stale one is detected and replaced at start-up.
+//!
+//! One command per connection, with the exception of `attach`: an interface sends that and then holds
+//! the connection open for as long as it is running, so the daemon can count how many interfaces are
+//! driving it and never stop while one of them still needs it. See [`attach`] and [`Command::Leave`].
 
 use serde::{Deserialize, Serialize};
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
@@ -80,6 +85,56 @@ pub enum Command {
     SetQueue(Vec<PathBuf>),
     /// Finish: the daemon exits.
     Quit,
+
+    // --- interfaces arriving and leaving ---
+    /// An interface saying it is here, and whether it is what started this daemon.
+    ///
+    /// Sent over a connection the interface then holds open, so an interface that crashes stops
+    /// being counted without having to say anything.
+    Attach { id: String, spawned: bool },
+    /// An interface saying it has gone, and what it would like done if it was the last one here.
+    Leave { id: String, on_leave: OnLeave },
+    /// How many interfaces are attached.
+    Interfaces,
+}
+
+/// What a leaving interface would like done with the daemon.
+///
+/// Only ever acted on once no interface is left: a daemon another interface is still driving is not
+/// the leaving one's to stop, whatever its config says.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum OnLeave {
+    /// Leave it playing.
+    #[default]
+    Keep,
+    /// Stop it, once nobody else is attached.
+    Stop,
+    /// Stop it only if an interface is what started it, and nobody else is attached.
+    ///
+    /// Which interface started it does not matter: an interface that inherits a daemon another one
+    /// spawned is the one that has to close it, or nothing would.
+    StopIfSpawned,
+}
+
+impl OnLeave {
+    /// The word the protocol carries.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Keep => "keep",
+            Self::Stop => "stop",
+            Self::StopIfSpawned => "stop_if_spawned",
+        }
+    }
+
+    /// Read one from the protocol. Nothing at all means keep: the safe answer.
+    pub fn parse(word: &str) -> Result<Self, String> {
+        match word.trim().to_lowercase().replace('-', "_").as_str() {
+            "" | "keep" => Ok(Self::Keep),
+            "stop" => Ok(Self::Stop),
+            "stop_if_spawned" => Ok(Self::StopIfSpawned),
+            other => Err(format!("leave takes keep, stop or stop_if_spawned, not {other:?}")),
+        }
+    }
 }
 
 impl Command {
@@ -107,6 +162,18 @@ impl Command {
             argument
                 .parse::<usize>()
                 .map_err(|_| format!("{what} takes a position, not {argument:?}"))
+        }
+
+        /// An interface's id and whatever followed it.
+        fn split_id(what: &str, argument: &str) -> Result<(String, String), String> {
+            if argument.is_empty() {
+                return Err(format!("{what} needs an id"));
+            }
+
+            match argument.split_once(char::is_whitespace) {
+                Some((id, rest)) => Ok((id.to_string(), rest.trim().to_string())),
+                None => Ok((argument.to_string(), String::new())),
+            }
         }
 
         match name.as_str() {
@@ -160,6 +227,22 @@ impl Command {
                     .map(Command::Volume)
                     .map_err(|_| format!("volume takes a number of points, not {argument:?}"))
             }
+            "attach" => {
+                let (id, rest) = split_id("attach", argument)?;
+
+                match rest.as_str() {
+                    "" => Ok(Command::Attach { id, spawned: false }),
+                    "spawned" => Ok(Command::Attach { id, spawned: true }),
+                    other => Err(format!("attach takes spawned, not {other:?}")),
+                }
+            }
+            // `detach` reads better from a command line, and means the same thing.
+            "leave" | "detach" => {
+                let (id, rest) = split_id("leave", argument)?;
+
+                Ok(Command::Leave { id, on_leave: OnLeave::parse(&rest)? })
+            }
+            "interfaces" => Ok(Command::Interfaces),
             "" => Err("no command".to_string()),
             other => Err(format!("unknown command {other:?}")),
         }
@@ -195,6 +278,15 @@ impl Command {
 
                 format!("set_queue {}", joined.join("\t"))
             }
+            Command::Attach { id, spawned } => {
+                if *spawned {
+                    format!("attach {id} spawned")
+                } else {
+                    format!("attach {id}")
+                }
+            }
+            Command::Leave { id, on_leave } => format!("leave {id} {}", on_leave.word()),
+            Command::Interfaces => "interfaces".to_string(),
         }
     }
 
@@ -215,7 +307,8 @@ impl Command {
             ("stop", "halt playback and rewind, keeping the queue"),
             ("clear", "stop and forget the queue and history"),
             ("status", "report what is playing, as JSON"),
-            ("quit/close", "kill the daemon"),
+            ("interfaces", "how many interfaces are attached"),
+            ("quit/close", "kill the daemon, whoever is attached"),
         ]
     }
 }
@@ -380,6 +473,9 @@ fn accept_loop(listener: UnixListener, sender: Sender<Request>) {
 }
 
 /// Read one command, hand it to the player, write back what the player says.
+///
+/// `attach` is the exception to one command per connection: its connection is held open afterwards,
+/// and when it ends — the interface closed, or was killed — the player is told the interface has gone.
 fn serve(stream: UnixStream, sender: Sender<Request>) {
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(stream) => stream,
@@ -392,25 +488,120 @@ fn serve(stream: UnixStream, sender: Sender<Request>) {
         return;
     }
 
-    let reply = match Command::parse(&line) {
+    let (reply, held) = match Command::parse(&line) {
         Ok(command) => {
-            let (answer, answered) = mpsc::channel();
+            // The id is kept before the command goes, so the departure can be reported under it.
+            let held = match &command {
+                Command::Attach { id, .. } => Some(id.clone()),
+                _ => None,
+            };
 
-            if sender.send(Request { command, reply: answer }).is_err() {
-                "error: the player is not accepting commands".to_string()
-            } else {
-                // The player answers from its event loop, so this waits rather than assuming.
-                match answered.recv_timeout(REPLY_TIMEOUT) {
-                    Ok(reply) => reply,
-                    Err(_) => "error: the player did not answer".to_string(),
-                }
-            }
+            (ask(&sender, command), held)
         }
-        Err(err) => format!("error: {err}"),
+        Err(err) => (format!("error: {err}"), None),
     };
 
     let _ = writeln!(writer, "{reply}");
     let _ = writer.flush();
+
+    let Some(id) = held else {
+        return;
+    };
+
+    // Nothing more is expected on this connection; what matters is when it ends. Anything that does
+    // arrive is read and dropped, so a client writing to it cannot wedge itself.
+    let mut ignored = String::new();
+    while matches!(reader.read_line(&mut ignored), Ok(read) if read > 0) {
+        ignored.clear();
+    }
+
+    // Keep, not the interface's own wish: an interface that vanished without saying so has not asked
+    // for anything, and guessing that it wanted the music stopped would be the wrong guess.
+    let _ = ask(&sender, Command::Leave { id, on_leave: OnLeave::Keep });
+}
+
+/// Put one command to the player and wait for its answer.
+fn ask(sender: &Sender<Request>, command: Command) -> String {
+    let (answer, answered) = mpsc::channel();
+
+    if sender.send(Request { command, reply: answer }).is_err() {
+        return "error: the player is not accepting commands".to_string();
+    }
+
+    // The player answers from its event loop, so this waits rather than assuming.
+    match answered.recv_timeout(REPLY_TIMEOUT) {
+        Ok(reply) => reply,
+        Err(_) => "error: the player did not answer".to_string(),
+    }
+}
+
+/// A held connection that tells a daemon an interface is here.
+///
+/// Nothing is ever sent over the connection again: it is held open because the daemon takes its
+/// closing as the interface having gone. An interface that is killed, or panics, therefore stops
+/// being counted at once rather than keeping a daemon alive forever.
+#[derive(Debug)]
+pub struct Attachment {
+    /// What this interface is called, for the daemon to count it under.
+    id: String,
+    /// Where the daemon is listening, for saying goodbye over a connection of its own.
+    path: PathBuf,
+    /// The connection whose end means this interface is gone.
+    _hold: UnixStream,
+}
+
+impl Attachment {
+    /// What this interface is called.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Say this interface has gone, and what to do with the daemon if it was the last one.
+    ///
+    /// The daemon decides: it knows how many interfaces are left, and only it can be sure another one
+    /// has not attached in the meantime. Its reply says what it did.
+    pub fn leave(&self, on_leave: OnLeave) -> Result<String, String> {
+        send_to(&self.path, &Command::Leave { id: self.id.clone(), on_leave })
+    }
+}
+
+/// Names for attachments, so two interfaces in one process are still two interfaces.
+static ATTACHMENTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Attach to the daemon as an interface, saying whether this process is what started it.
+pub fn attach(spawned: bool) -> Result<Attachment, String> {
+    attach_to(&socket_path(), spawned)
+}
+
+/// [`attach`], to the daemon listening on `path`.
+pub fn attach_to(path: &Path, spawned: bool) -> Result<Attachment, String> {
+    let id = format!("{}-{}", std::process::id(), ATTACHMENTS.fetch_add(1, Ordering::Relaxed));
+
+    let stream = UnixStream::connect(path)
+        .map_err(|err| format!("no player listening on {} ({err})", path.display()))?;
+
+    // Only while attaching: the connection is held open afterwards, where a read timeout would end it.
+    stream.set_read_timeout(Some(REPLY_TIMEOUT)).ok();
+
+    let mut writer = stream.try_clone().map_err(|err| err.to_string())?;
+    let command = Command::Attach { id: id.clone(), spawned };
+    writeln!(writer, "{}", command.to_line()).map_err(|err| err.to_string())?;
+    writer.flush().map_err(|err| err.to_string())?;
+
+    let mut reply = String::new();
+    BufReader::new(stream.try_clone().map_err(|err| err.to_string())?)
+        .read_line(&mut reply)
+        .map_err(|err| format!("no answer from the player ({err})"))?;
+
+    if reply.trim_start().starts_with("error") {
+        return Err(reply.trim().to_string());
+    }
+
+    // The daemon has answered, so nothing else will be read from here; a timeout would only close a
+    // connection whose whole job is to stay open.
+    stream.set_read_timeout(None).ok();
+
+    Ok(Attachment { id, path: path.to_path_buf(), _hold: stream })
 }
 
 /// Send one command to a running player and return what it says.
@@ -473,6 +664,38 @@ mod tests {
     }
 
     #[test]
+    fn an_interface_names_itself_and_says_what_it_wants_on_the_way_out() {
+        assert_eq!(
+            Command::parse("attach 4213-0").expect("a command"),
+            Command::Attach { id: "4213-0".to_string(), spawned: false }
+        );
+        assert_eq!(
+            Command::parse("attach 4213-0 spawned").expect("a command"),
+            Command::Attach { id: "4213-0".to_string(), spawned: true }
+        );
+
+        // Nothing said about the daemon means leave it alone, which is the safe reading.
+        assert_eq!(
+            Command::parse("leave 4213-0").expect("a command"),
+            Command::Leave { id: "4213-0".to_string(), on_leave: OnLeave::Keep }
+        );
+        assert_eq!(
+            Command::parse("detach 4213-0 stop").expect("a command"),
+            Command::Leave { id: "4213-0".to_string(), on_leave: OnLeave::Stop }
+        );
+        assert_eq!(
+            Command::parse("leave 4213-0 stop-if-spawned").expect("a command"),
+            Command::Leave { id: "4213-0".to_string(), on_leave: OnLeave::StopIfSpawned }
+        );
+        assert_eq!(Command::parse("interfaces").expect("a command"), Command::Interfaces);
+
+        assert!(Command::parse("attach").unwrap_err().contains("needs an id"));
+        assert!(Command::parse("leave").unwrap_err().contains("needs an id"));
+        assert!(Command::parse("attach 1 sideways").unwrap_err().contains("spawned"));
+        assert!(Command::parse("leave 1 sideways").unwrap_err().contains("keep, stop"));
+    }
+
+    #[test]
     fn what_cannot_be_read_says_why() {
         assert!(Command::parse("").unwrap_err().contains("no command"));
         assert!(Command::parse("dance").unwrap_err().contains("unknown"));
@@ -493,6 +716,12 @@ mod tests {
             Command::AddPlaylist("Road Trip".to_string()),
             Command::PlaySong("Xtal".to_string()),
             Command::Volume(-15),
+            Command::Attach { id: "4213-0".to_string(), spawned: false },
+            Command::Attach { id: "4213-1".to_string(), spawned: true },
+            Command::Leave { id: "4213-0".to_string(), on_leave: OnLeave::Keep },
+            Command::Leave { id: "4213-0".to_string(), on_leave: OnLeave::Stop },
+            Command::Leave { id: "4213-1".to_string(), on_leave: OnLeave::StopIfSpawned },
+            Command::Interfaces,
         ] {
             let line = command.to_line();
 
