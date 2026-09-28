@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::ipc::{self, Attachment, Command, OnLeave, Status};
-use crate::player::{Controls, PlaybackState, Player};
+use crate::player::{Controls, Mirrored, PlaybackState, Player, Repeat};
 use crate::playlist::Playlist;
 use crate::song::Song;
 
@@ -133,14 +133,19 @@ impl Remote {
             _ => PlaybackState::Stopped,
         };
 
-        self.mirror.mirror(
+        // A word this build does not know reads as off rather than failing the whole status: the rest
+        // of it still says what is playing.
+        let repeat = Repeat::parse(&status.repeat).unwrap_or_default();
+
+        self.mirror.mirror(Mirrored {
             state,
-            Duration::from_millis(status.position_ms),
-            status.volume,
-            status.current.as_deref().map(Song::new),
-            status.queue.iter().map(Song::new).collect(),
-            status.history.iter().map(Song::new).collect(),
-        );
+            position: Duration::from_millis(status.position_ms),
+            volume: status.volume,
+            current: status.current.as_deref().map(Song::new),
+            queue: status.queue.iter().map(Song::new).collect(),
+            history: status.history.iter().map(Song::new).collect(),
+            repeat,
+        });
     }
 
     /// Send a command, noting whether the daemon was there to take it.
@@ -206,6 +211,20 @@ impl Controls for Remote {
         // The daemon does the shuffling: two shuffles would disagree, and its one is the one that
         // plays. The mirror catches up on the next status.
         self.send(Command::Shuffle);
+    }
+
+    fn cycle_repeat(&mut self) -> Repeat {
+        // Moved in the mirror too, so the screen says the new mode at once; the next status is what
+        // settles it.
+        let mode = Controls::cycle_repeat(&mut self.mirror);
+        self.send(Command::Repeat(None));
+
+        mode
+    }
+
+    fn set_repeat(&mut self, repeat: Repeat) {
+        Controls::set_repeat(&mut self.mirror, repeat);
+        self.send(Command::Repeat(Some(repeat)));
     }
 
     fn change_volume(&mut self, change: f32) {

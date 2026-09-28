@@ -8,7 +8,7 @@ mod common;
 use std::time::Duration;
 
 use ogma::config::Config;
-use ogma::player::{PlaybackState, Player};
+use ogma::player::{PlaybackState, Player, Repeat};
 use ogma::playlist::{Playlist, SortBy};
 use ogma::song::Song;
 
@@ -353,4 +353,115 @@ fn queue_duration_needs_every_song_to_state_its_length() {
 
     player.add_queue(song("unknown"));
     assert_eq!(player.queue_duration(), None);
+}
+
+// ------------------------------------------------------------------------------------- repeating
+
+/// A player part-way through a queue of three, one song already played.
+fn mid_queue() -> Player {
+    let mut player = Player::new();
+    player.add_queue_all([song("first"), song("second"), song("third")]);
+    player.play();
+    player.skip();
+
+    player
+}
+
+#[test]
+fn repeating_is_off_until_it_is_asked_for_and_cycles_from_there() {
+    let mut player = Player::new();
+    assert_eq!(player.repeat(), Repeat::Off);
+
+    assert_eq!(player.cycle_repeat(), Repeat::Queue);
+    assert_eq!(player.cycle_repeat(), Repeat::Song);
+    assert_eq!(player.cycle_repeat(), Repeat::Off, "round to where it started");
+
+    player.set_repeat(Repeat::Song);
+    assert_eq!(player.repeat(), Repeat::Song);
+}
+
+#[test]
+fn a_song_that_runs_out_moves_on_unless_something_repeats() {
+    // Off: the next song plays, and the queue runs out into silence.
+    let mut player = mid_queue();
+    assert_eq!(player.current(), Some(&song("second")));
+
+    player.song_ended();
+    assert_eq!(player.current(), Some(&song("third")));
+
+    player.song_ended();
+    assert!(player.current().is_none(), "nothing left, so nothing plays");
+    assert_eq!(player.state(), PlaybackState::Stopped);
+    assert_eq!(player.history().len(), 3, "all three played");
+}
+
+#[test]
+fn song_repeat_plays_the_same_song_again_from_its_start() {
+    let mut player = mid_queue();
+    player.set_repeat(Repeat::Song);
+    player.set_position(Duration::from_secs(30));
+
+    player.song_ended();
+
+    assert_eq!(player.current(), Some(&song("second")), "the same song");
+    assert_eq!(player.position(), Duration::ZERO, "from the beginning");
+    assert_eq!(player.state(), PlaybackState::Playing);
+    assert_eq!(player.queue().len(), 1, "and the queue is untouched");
+    assert_eq!(player.history(), [song("first")], "a song played again is not a song played twice");
+
+    // Pressing next is still pressing next: a repeat setting is about songs ending by themselves.
+    player.skip();
+    assert_eq!(player.current(), Some(&song("third")));
+}
+
+#[test]
+fn queue_repeat_starts_the_queue_again_once_it_has_played_out() {
+    let mut player = mid_queue();
+    player.set_repeat(Repeat::Queue);
+
+    // Nothing changes until the end is reached: this is about the queue, not each song.
+    player.song_ended();
+    assert_eq!(player.current(), Some(&song("third")));
+    assert_eq!(player.history(), [song("first"), song("second")]);
+
+    // The end of the last song is where it comes round: what played is queued again, in the order it
+    // played, and the first of it starts.
+    player.song_ended();
+
+    assert_eq!(player.current(), Some(&song("first")));
+    assert_eq!(player.queue(), [song("second"), song("third")]);
+    assert_eq!(player.state(), PlaybackState::Playing);
+    assert_eq!(player.position(), Duration::ZERO);
+    assert!(player.history().is_empty(), "the cycle starts over with nothing behind it");
+
+    // Pressing next at the end wraps too: with the queue repeating, there is always a next song.
+    player.song_ended();
+    player.song_ended();
+    assert_eq!(player.current(), Some(&song("third")));
+    player.skip();
+    assert_eq!(player.current(), Some(&song("first")), "round again");
+
+    // Turning it off leaves the end of the queue as the end.
+    player.set_repeat(Repeat::Off);
+    player.song_ended();
+    player.song_ended();
+    player.song_ended();
+    assert!(player.current().is_none());
+    assert_eq!(player.state(), PlaybackState::Stopped);
+}
+
+#[test]
+fn repeating_a_single_song_queue_keeps_it_going() {
+    // A queue of one that has come round is the same song again, whichever mode asked for it.
+    for mode in [Repeat::Queue, Repeat::Song] {
+        let mut player = Player::new();
+        player.add_queue(song("only"));
+        player.play();
+        player.set_repeat(mode);
+
+        player.song_ended();
+
+        assert_eq!(player.current(), Some(&song("only")), "{mode:?}");
+        assert_eq!(player.state(), PlaybackState::Playing, "{mode:?}");
+    }
 }

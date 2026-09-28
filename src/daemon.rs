@@ -128,7 +128,9 @@ impl Daemon {
         }
 
         if audio.finished() {
-            self.player.skip();
+            // A song that ran out is not the same as being asked for the next one: what happens here
+            // is what the repeat setting is about.
+            self.player.song_ended();
             self.sync();
         }
     }
@@ -147,6 +149,7 @@ impl Daemon {
             current: self.player.current().map(|song| song.path().to_path_buf()),
             queue: self.player.queue().iter().map(|song| song.path().to_path_buf()).collect(),
             history: self.player.history().iter().map(|song| song.path().to_path_buf()).collect(),
+            repeat: self.player.repeat().word().to_string(),
         }
     }
 
@@ -221,6 +224,17 @@ impl Daemon {
                 self.player.shuffle_queue();
 
                 format!("ok: shuffled {} queued", self.player.queue().len())
+            }
+            Command::Repeat(mode) => {
+                let mode = match mode {
+                    Some(mode) => {
+                        self.player.set_repeat(mode);
+                        mode
+                    }
+                    None => self.player.cycle_repeat(),
+                };
+
+                format!("ok: {}", mode.label())
             }
             Command::Volume(points) => {
                 self.player.change_volume(points as f32 / 100.0);
@@ -392,7 +406,12 @@ impl Daemon {
 
         match self.player.current() {
             Some(song) => {
-                if audio.loaded() != Some(song.path()) {
+                // A device that has finished has let go of the file, so playing that same song again —
+                // song repeat, or a queue that has come round to it — means opening it afresh rather
+                // than seeking something that is no longer there.
+                let replaying = audio.finished() && self.player.is_playing();
+
+                if audio.loaded() != Some(song.path()) || replaying {
                     let _ = audio.load(song.path(), self.player.position());
                 } else if self.player.state() == PlaybackState::Stopped {
                     if audio.position() > Duration::from_millis(500) {

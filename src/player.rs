@@ -31,6 +31,10 @@ pub trait Controls {
     fn skip(&mut self);
     fn previous(&mut self);
     fn shuffle_queue(&mut self);
+    /// Move to the next repeat mode, returning the one now in force.
+    fn cycle_repeat(&mut self) -> Repeat;
+    /// Repeat as `repeat` says, whatever the mode was before.
+    fn set_repeat(&mut self, repeat: Repeat);
     fn change_volume(&mut self, change: f32);
     /// Move the position, forwards or back, without running past the start.
     fn seek(&mut self, change: std::time::Duration, forwards: bool);
@@ -76,6 +80,14 @@ impl Controls for Player {
         Player::shuffle_queue(self);
     }
 
+    fn cycle_repeat(&mut self) -> Repeat {
+        Player::cycle_repeat(self)
+    }
+
+    fn set_repeat(&mut self, repeat: Repeat) {
+        Player::set_repeat(self, repeat);
+    }
+
     fn change_volume(&mut self, change: f32) {
         Player::change_volume(self, change);
     }
@@ -115,27 +127,35 @@ impl Controls for Player {
     }
 }
 
+/// Everything a player takes from elsewhere in one go, for [`Player::mirror`].
+#[derive(Debug, Default, Clone)]
+pub struct Mirrored {
+    pub state: PlaybackState,
+    pub position: Duration,
+    pub volume: f32,
+    /// The song playing now.
+    pub current: Option<Song>,
+    /// Songs waiting to play, next one first.
+    pub queue: Vec<Song>,
+    /// Songs that have already played, most recent last.
+    pub history: Vec<Song>,
+    pub repeat: Repeat,
+}
+
 /// Take the state of another player, as the interface does with what the daemon reports.
 impl Player {
     /// Replace everything about this player with `state`.
     ///
     /// Used by the interface to mirror the daemon: the queue and what is playing belong to the
     /// daemon, and this is how they arrive.
-    pub fn mirror(
-        &mut self,
-        state: PlaybackState,
-        position: std::time::Duration,
-        volume: f32,
-        current: Option<Song>,
-        queue: Vec<Song>,
-        history: Vec<Song>,
-    ) {
-        self.state = state;
-        self.position = position;
-        self.volume = volume;
-        self.current = current;
-        self.queue = queue;
-        self.previous = history;
+    pub fn mirror(&mut self, state: Mirrored) {
+        self.state = state.state;
+        self.position = state.position;
+        self.volume = state.volume;
+        self.current = state.current;
+        self.queue = state.queue;
+        self.previous = state.history;
+        self.repeat = state.repeat;
     }
 }
 
@@ -148,6 +168,61 @@ pub enum PlaybackState {
     Stopped,
     Playing,
     Paused,
+}
+
+/// What happens when a song runs out.
+///
+/// Only the natural end of a song is affected. Pressing next always moves on, and pressing previous
+/// always goes back: a repeat setting says what to do when nobody is asking for anything.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum Repeat {
+    /// Play the queue once and stop at its end.
+    #[default]
+    Off,
+    /// Start the queue again once it has played out.
+    Queue,
+    /// Play the current song over until something says otherwise.
+    Song,
+}
+
+impl Repeat {
+    /// Every mode, in the order the interface cycles through them.
+    pub const ALL: [Repeat; 3] = [Self::Off, Self::Queue, Self::Song];
+
+    /// The word the protocol and the config carry.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Queue => "queue",
+            Self::Song => "song",
+        }
+    }
+
+    /// Read a mode from its word. `all` and `one` are taken from the players that use those names.
+    pub fn parse(word: &str) -> Result<Self, String> {
+        match word.trim().to_lowercase().as_str() {
+            "off" | "none" => Ok(Self::Off),
+            "queue" | "all" => Ok(Self::Queue),
+            "song" | "one" | "track" => Ok(Self::Song),
+            other => Err(format!("repeat takes off, queue or song, not {other:?}")),
+        }
+    }
+
+    /// What the interface shows, when it is worth showing at all.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "repeat off",
+            Self::Queue => "repeat queue",
+            Self::Song => "repeat song",
+        }
+    }
+
+    /// The next mode in the cycle.
+    pub fn next(self) -> Self {
+        let index = Self::ALL.iter().position(|mode| *mode == self).unwrap_or(0);
+
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
 }
 
 /// What the player is playing, and what it will play next.
@@ -164,6 +239,8 @@ pub struct Player {
     /// Songs that have already played, most recent last.
     previous: Vec<Song>,
     state: PlaybackState,
+    /// What happens when a song runs out.
+    repeat: Repeat,
 }
 
 impl Player {
@@ -199,6 +276,22 @@ impl Player {
     /// Whether the player is playing, paused or stopped.
     pub fn state(&self) -> PlaybackState {
         self.state
+    }
+
+    /// What happens when a song runs out.
+    pub fn repeat(&self) -> Repeat {
+        self.repeat
+    }
+
+    pub fn set_repeat(&mut self, repeat: Repeat) {
+        self.repeat = repeat;
+    }
+
+    /// Move to the next repeat mode, returning the one now in force.
+    pub fn cycle_repeat(&mut self) -> Repeat {
+        self.repeat = self.repeat.next();
+
+        self.repeat
     }
 
     pub fn is_playing(&self) -> bool {
@@ -423,12 +516,35 @@ impl Player {
         self.current = (!self.queue.is_empty()).then(|| self.queue.remove(0));
         self.position = Duration::ZERO;
 
+        // The end of the queue is where repeating it means something: what has played becomes what is
+        // queued, in the order it played, and the first of them starts. The history empties as it goes
+        // back into the queue, so going backwards still only reaches what played this time round.
+        if self.current.is_none() && self.repeat == Repeat::Queue && !self.previous.is_empty() {
+            self.queue = std::mem::take(&mut self.previous);
+            self.current = Some(self.queue.remove(0));
+        }
+
         if self.current.is_none() {
             // Nothing left to play.
             self.state = PlaybackState::Stopped;
         }
 
         self.current.as_ref()
+    }
+
+    /// What to do with a song that has run out on its own.
+    ///
+    /// Apart from [`Repeat::Song`], which plays it again, this is [`Player::skip`]: the difference
+    /// between a song ending and someone pressing next is what a repeat setting is for.
+    pub fn song_ended(&mut self) -> Option<&Song> {
+        if self.repeat == Repeat::Song && self.current.is_some() {
+            self.position = Duration::ZERO;
+            self.state = PlaybackState::Playing;
+
+            return self.current.as_ref();
+        }
+
+        self.skip()
     }
 
     /// Move back to the song that played before this one.

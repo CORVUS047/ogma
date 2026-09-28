@@ -10,7 +10,7 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, List, ListItem, ListState, Padding};
 
-use crate::player::{Controls, PlaybackState, Player};
+use crate::player::{Controls, PlaybackState, Player, Repeat};
 use crate::song::Song;
 use crate::theme::Theme;
 use crate::volume;
@@ -214,6 +214,10 @@ impl PlayerScreen {
             KeyCode::Char('n') => player.skip(),
             KeyCode::Char('p') => player.previous(),
             KeyCode::Char('S') => player.stop(),
+            // Upper case, like stop: the lower-case letter belongs to the playlists' sort.
+            KeyCode::Char('R') => {
+                player.cycle_repeat();
+            }
             // Shuffling rearranges what is coming, not what is playing.
             KeyCode::Char('z') => player.shuffle_queue(),
 
@@ -512,18 +516,20 @@ impl PlayerScreen {
         // fonts. The volume keys survive into every spelling: the bar above says where the fader is,
         // and without them nothing on screen says how to move it.
         const LONG: &str = "space play/pause · n/p track · left/right seek · +/- volume · \
-                            z shuffle · S stop · tab pane · q back";
-        const MEDIUM: &str =
-            "space pause · n/p track · left/right seek · +/- volume · z shuffle · q back";
-        const SHORT: &str = "space pause · n/p track · +/- volume · q back";
-        const TINY: &str = "space · n/p · +/- vol · q";
+                            z shuffle · R repeat · S stop · tab pane · q back";
+        const MEDIUM: &str = "space pause · n/p track · left/right seek · +/- volume · \
+                              z shuffle · R repeat · q back";
+        const SHORT: &str = "space pause · n/p track · +/- volume · R repeat · q back";
+        const TINY: &str = "space · n/p · +/- vol · R repeat · q";
+        // Keys and nothing else: past this width a word about any of them would push another key off.
+        const MICRO: &str = "space · n/p · +/- · R · q";
 
         if !self.hints {
             return;
         }
 
         let room = keys_area.width as usize;
-        let keys = [LONG, MEDIUM, SHORT, TINY]
+        let keys = [LONG, MEDIUM, SHORT, TINY, MICRO]
             .into_iter()
             .find(|candidate| candidate.chars().count() <= room)
             .unwrap_or("");
@@ -538,15 +544,31 @@ impl PlayerScreen {
         // A queue that has shrunk since the last frame must not leave the selection past its end.
         self.clamp_selection(player.queue().len());
 
-        let block = pane(" Queue ", focused, &self.theme).padding(Padding::horizontal(1));
+        // Repeating is about what comes next, so the queue is where it is said. Off is the ordinary
+        // state and goes unmentioned; the title would otherwise carry a word that never changes.
+        let title = match player.repeat() {
+            Repeat::Off => " Queue ".to_string(),
+            mode => format!(" Queue · {} ", mode.label()),
+        };
+
+        let block = pane(title, focused, &self.theme).padding(Padding::horizontal(1));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
+        // The keys keep their row whether or not this pane has the focus, so the listing does not
+        // change height as the focus moves between panes.
+        let keys_rows = if self.hints { 1 } else { 0 };
+
         // The played songs and the current one sit at a fixed height, so the current song stays put
         // as the queue below it changes.
-        let [context_area, upcoming_area] =
-            Layout::vertical([Constraint::Length(HISTORY_SHOWN as u16 + 1), Constraint::Fill(1)])
-                .areas(inner);
+        let [context_area, upcoming_area, keys_area] = Layout::vertical([
+            Constraint::Length(HISTORY_SHOWN as u16 + 1),
+            Constraint::Fill(1),
+            Constraint::Length(keys_rows),
+        ])
+        .areas(inner);
+
+        self.render_queue_keys(frame, keys_area, focused);
 
         let width = inner.width as usize;
         let history = player.history();
@@ -610,13 +632,36 @@ impl PlayerScreen {
 
         frame.render_stateful_widget(list, upcoming_area, &mut self.queue_state);
     }
+
+    /// The queue's own keys, which nothing else on screen names.
+    fn render_queue_keys(&self, frame: &mut Frame<'_>, area: Rect, focused: bool) {
+        // Two spellings, so a narrow pane says less rather than showing a clipped line. The repeat key
+        // is not among them: it belongs to the transport, which names it, and what it is set to is in
+        // this pane's title.
+        const LONG: &str = "enter play · x remove";
+        const SHORT: &str = "enter · x";
+
+        // Listed only while the pane has the keys, as the other panes' are: keys that do nothing to
+        // what is highlighted would be a lie.
+        if !self.hints || !focused {
+            return;
+        }
+
+        let room = area.width as usize;
+        let keys = [LONG, SHORT]
+            .into_iter()
+            .find(|candidate| candidate.chars().count() <= room)
+            .unwrap_or("");
+
+        frame.render_widget(Line::from(keys).style(self.theme.muted()).centered(), area);
+    }
 }
 
 /// A pane border, brighter when it has the keys.
-fn pane(title: &'static str, focused: bool, theme: &Theme) -> Block<'static> {
+fn pane(title: impl Into<String>, focused: bool, theme: &Theme) -> Block<'static> {
     Block::bordered()
         .border_type(BorderType::Rounded)
-        .title(Line::from(title).centered().style(theme.title()))
+        .title(Line::from(title.into()).centered().style(theme.title()))
         .border_style(theme.border(focused))
 }
 

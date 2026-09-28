@@ -18,6 +18,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::player::Repeat;
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -51,6 +53,8 @@ pub enum Command {
     Previous,
     /// Rearrange the queue.
     Shuffle,
+    /// What happens when a song runs out: `None` moves to the next mode, `Some` sets one.
+    Repeat(Option<Repeat>),
     /// Replace the queue with a playlist.
     LoadPlaylist(String),
     /// Add a playlist to the end of the queue.
@@ -183,6 +187,12 @@ impl Command {
             "next" => Ok(Command::Next),
             "previous" | "prev" => Ok(Command::Previous),
             "shuffle" => Ok(Command::Shuffle),
+            // No mode named cycles, which is what a keybinding wants; a named one sets it, which is
+            // what a script wants.
+            "repeat" => match argument {
+                "" | "cycle" | "next" => Ok(Command::Repeat(None)),
+                word => Repeat::parse(word).map(|mode| Command::Repeat(Some(mode))),
+            },
             "load_playlist" => Ok(Command::LoadPlaylist(needs_name("load_playlist")?)),
             "add_playlist" => Ok(Command::AddPlaylist(needs_name("add_playlist")?)),
             "play_song" => Ok(Command::PlaySong(needs_name("play_song")?)),
@@ -257,6 +267,10 @@ impl Command {
             Command::Next => "next".to_string(),
             Command::Previous => "previous".to_string(),
             Command::Shuffle => "shuffle".to_string(),
+            Command::Repeat(mode) => match mode {
+                Some(mode) => format!("repeat {}", mode.word()),
+                None => "repeat".to_string(),
+            },
             Command::LoadPlaylist(name) => format!("load_playlist {name}"),
             Command::AddPlaylist(name) => format!("add_playlist {name}"),
             Command::PlaySong(name) => format!("play_song {name}"),
@@ -299,6 +313,7 @@ impl Command {
             ("next", "on to the next song in the queue"),
             ("previous", "back to the song that played before"),
             ("shuffle", "rearrange the queue"),
+            ("repeat [off|queue|song]", "cycle what repeats, or set it"),
             ("load_playlist <name>", "replace the queue with a playlist"),
             ("add_playlist <name>", "add a playlist to the end of the queue"),
             ("play_song <name>", "find a song in the library and play it"),
@@ -331,6 +346,11 @@ pub struct Status {
     pub queue: Vec<PathBuf>,
     /// What has played, most recent last.
     pub history: Vec<PathBuf>,
+    /// What happens when a song runs out: `off`, `queue` or `song`.
+    ///
+    /// Defaulted, so a status from a daemon that predates repeat still reads.
+    #[serde(default)]
+    pub repeat: String,
 }
 
 impl Status {
@@ -696,6 +716,32 @@ mod tests {
     }
 
     #[test]
+    fn repeat_is_cycled_by_a_bare_command_and_set_by_a_named_one() {
+        assert_eq!(Command::parse("repeat").expect("a command"), Command::Repeat(None));
+        assert_eq!(Command::parse("repeat cycle").expect("a command"), Command::Repeat(None));
+        assert_eq!(
+            Command::parse("repeat off").expect("a command"),
+            Command::Repeat(Some(Repeat::Off))
+        );
+        assert_eq!(
+            Command::parse("repeat QUEUE").expect("a command"),
+            Command::Repeat(Some(Repeat::Queue))
+        );
+
+        // The names other players use read the same here.
+        assert_eq!(
+            Command::parse("repeat all").expect("a command"),
+            Command::Repeat(Some(Repeat::Queue))
+        );
+        assert_eq!(
+            Command::parse("repeat one").expect("a command"),
+            Command::Repeat(Some(Repeat::Song))
+        );
+
+        assert!(Command::parse("repeat sideways").unwrap_err().contains("off, queue or song"));
+    }
+
+    #[test]
     fn what_cannot_be_read_says_why() {
         assert!(Command::parse("").unwrap_err().contains("no command"));
         assert!(Command::parse("dance").unwrap_err().contains("unknown"));
@@ -716,6 +762,10 @@ mod tests {
             Command::AddPlaylist("Road Trip".to_string()),
             Command::PlaySong("Xtal".to_string()),
             Command::Volume(-15),
+            Command::Repeat(None),
+            Command::Repeat(Some(Repeat::Off)),
+            Command::Repeat(Some(Repeat::Queue)),
+            Command::Repeat(Some(Repeat::Song)),
             Command::Attach { id: "4213-0".to_string(), spawned: false },
             Command::Attach { id: "4213-1".to_string(), spawned: true },
             Command::Leave { id: "4213-0".to_string(), on_leave: OnLeave::Keep },

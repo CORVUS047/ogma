@@ -4,7 +4,7 @@ mod common;
 
 use std::time::Duration;
 
-use ogma::player::{PlaybackState, Player};
+use ogma::player::{PlaybackState, Player, Repeat};
 use ogma::song::Song;
 use ogma::ui::{PlayerScreen, PlayerScreenOutcome};
 use ratatui::Terminal;
@@ -611,4 +611,45 @@ fn embedded_artwork_is_drawn_in_colour() {
     plain.add_queue(song("no-art"));
     plain.play();
     assert!(frame_of(&mut isolated_screen(), &plain).contains("no artwork"));
+}
+
+#[test]
+fn the_repeat_key_cycles_the_mode_and_the_queue_pane_says_which() {
+    let mut screen = isolated_screen();
+    let mut player = playing();
+
+    // Off is the ordinary state, and the pane says nothing about it.
+    assert!(!frame_of(&mut screen, &player).contains("repeat queue"));
+
+    press(&mut screen, &mut player, KeyCode::Char('R'));
+    assert_eq!(player.repeat(), Repeat::Queue);
+    let frame = frame_of(&mut screen, &player);
+    assert!(frame.contains("repeat queue"), "the queue pane says what it will do: {frame}");
+
+    press(&mut screen, &mut player, KeyCode::Char('R'));
+    assert_eq!(player.repeat(), Repeat::Song);
+    assert!(frame_of(&mut screen, &player).contains("repeat song"));
+
+    press(&mut screen, &mut player, KeyCode::Char('R'));
+    assert_eq!(player.repeat(), Repeat::Off);
+    let frame = frame_of(&mut screen, &player);
+    assert!(!frame.contains("repeat queue") && !frame.contains("repeat song"), "{frame}");
+    assert!(frame.contains("Queue"), "the pane is still the queue: {frame}");
+}
+
+#[test]
+fn the_queue_pane_lists_its_own_keys_once_it_has_the_focus() {
+    let mut screen = isolated_screen();
+    let mut player = playing();
+
+    // The keys act on what is highlighted, so they are named where the highlight means something.
+    assert!(!frame_of(&mut screen, &player).contains("enter play"));
+
+    focus_queue(&mut screen, &mut player);
+    let frame = frame_of(&mut screen, &player);
+    assert!(frame.contains("enter play"), "how to play a queued song: {frame}");
+    assert!(frame.contains("x remove"), "and how to take one out: {frame}");
+
+    screen.set_hints(false);
+    assert!(!frame_of(&mut screen, &player).contains("enter play"), "hidden with the rest");
 }

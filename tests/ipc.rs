@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use ogma::config::Config;
 use ogma::daemon::Daemon;
-use ogma::ipc::{self, Command, OnLeave, Server};
+use ogma::ipc::{self, Command, OnLeave, Server, Status};
+use ogma::player::Repeat;
 use ogma::playlist::Playlist;
 
 /// A short, unique socket path, removed if something left one behind.
@@ -135,6 +136,26 @@ fn a_client_with_nobody_to_talk_to_says_so() {
 
     assert!(err.contains("no player listening"), "{err}");
     assert!(err.contains(&path.display().to_string()), "and says where it looked: {err}");
+}
+
+#[test]
+fn the_player_cycles_what_repeats_and_reports_it_in_its_status() {
+    let mut daemon = Daemon::with_config(&Config::default());
+
+    let status = Status::parse(&daemon.apply(Command::Status)).expect("a status");
+    assert_eq!(status.repeat, "off", "nothing repeats until it is asked for");
+
+    // No mode named cycles, which is what a keybinding sends.
+    assert_eq!(daemon.apply(Command::Repeat(None)), "ok: repeat queue");
+    assert_eq!(daemon.apply(Command::Repeat(None)), "ok: repeat song");
+    assert_eq!(daemon.apply(Command::Repeat(None)), "ok: repeat off");
+
+    // A named one sets it, which is what a script sends.
+    assert_eq!(daemon.apply(Command::Repeat(Some(Repeat::Song))), "ok: repeat song");
+    assert_eq!(daemon.apply(Command::Repeat(Some(Repeat::Song))), "ok: repeat song", "again is fine");
+
+    let status = Status::parse(&daemon.apply(Command::Status)).expect("a status");
+    assert_eq!(status.repeat, "song", "and the interface can see it");
 }
 
 // -------------------------------------------------------------- interfaces coming and going

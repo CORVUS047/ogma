@@ -61,7 +61,7 @@ fn print_usage() {
     eprintln!("usage: ogma-cmd <command> [name]\n");
 
     for (name, what) in Command::usage() {
-        eprintln!("  {name:<22} {what}");
+        eprintln!("  {name:<24} {what}");
     }
 
     eprintln!("\nthe player is found at {}", ipc::socket_path().display());

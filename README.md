@@ -109,6 +109,7 @@ Playback:
 | `+` `=` / `-` `_` | Volume, 5 points a press |
 | `S` | Stop and rewind, keeping the queue |
 | `z` | Shuffle the queue |
+| `R` | Cycle repeat: off → queue → song |
 | `tab` / `shift-tab`, `l` / `h` | Next / previous pane |
 | `q`, esc | Back to the menu (playback carries on) |
 
@@ -143,7 +144,23 @@ Queue pane:
 | enter | Play this entry now |
 | `x`, delete | Take it out of the queue |
 
-The three played songs above the current one stay visible, so the current song holds its row.
+The three played songs above the current one stay visible, so the current song holds its row. The
+pane's title says what repeats when anything does — `Queue · repeat song`.
+
+#### Repeating
+
+`R` cycles three modes, and the mode lives in the daemon, so it holds whether or not an interface is
+attached:
+
+| Mode | What happens when a song runs out |
+| --- | --- |
+| off | The next queued song plays; the end of the queue is silence |
+| queue | At the end of the queue, what played is queued again in the order it played, and the first of it starts |
+| song | The same song plays again from its beginning |
+
+Only a song **ending by itself** is affected. `n` and `p` always move on and back — that is what they
+are for. The one exception is the end of the queue with queue repeat on, where `n` wraps round to the
+start rather than stopping, since there is always a next song.
 
 #### Configuration:
 
@@ -186,6 +203,7 @@ ok: queued 24 from Late Night by title
 | `next` | On to the next song in the queue |
 | `previous` | Back to the song that played before |
 | `shuffle` | Rearrange the queue |
+| `repeat [off\|queue\|song]` | Cycle what repeats, or set it. `all` and `one` are accepted for queue and song |
 | `load_playlist <name>` | Replace the queue with a playlist |
 | `add_playlist <name>` | Add a playlist to the end of the queue |
 | `play_song <name>` | Find a song in the library and play it |
@@ -193,7 +211,7 @@ ok: queued 24 from Late Night by title
 | `seek <±seconds>` | Move the position, e.g. `30` or `-10` |
 | `stop` | Halt playback and rewind, keeping the queue |
 | `clear` | Stop and forget the queue and history |
-| `status` | Report what is playing, as JSON |
+| `status` | Report what is playing, as JSON, including what repeats |
 | `interfaces` | How many interfaces are attached |
 | `quit`, `close` | Kill the daemon, whoever is attached |
 
