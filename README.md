@@ -160,8 +160,22 @@ Files pane:
 | `a` | Queue the highlighted file |
 | `A` | Queue everything in the folder, recursively |
 | `P` | Add the highlighted file to the selected playlist |
+| `x` | Pick the highlighted file or folder up to move it; again puts it back down |
+| `M` | Move everything held into the folder being listed |
 | `/` | Find in the listing; esc clears it |
 | `j` `k` `g` `G`, page up / down | Move |
+
+Moving files: `x` marks a row — the margin shows `✂` — then walk wherever you like and press `M` to
+move everything held into the folder on screen. Folders move whole, several things can be held at
+once, and holding survives walking about: that is the point of it.
+
+Nothing is ever overwritten. A name already taken in the target folder, a folder being put inside
+itself, or a file that has since gone is refused and stays held, so a second `M` somewhere else is
+one key away. A move between filesystems copies and then removes, so an interrupted one leaves the
+file where it was.
+
+A queued file keeps the path it was queued under, so moving it leaves the queue pointing where it
+used to be. Move first, queue after.
 
 Playlists pane:
 

@@ -56,6 +56,12 @@ pub struct FilePane {
     visible: Vec<usize>,
     /// Whether keys are going into the search rather than into the listing.
     searching: bool,
+    /// Files and folders picked up with `x`, waiting to be put down somewhere with `p`.
+    ///
+    /// Held as absolute paths rather than as positions in the listing: the point of holding
+    /// something is to walk somewhere else before putting it down, and the listing changes on the
+    /// way.
+    held: Vec<PathBuf>,
     /// Whether to list the keys under the listing.
     hints: bool,
     /// Whether to report what an action did.
@@ -88,6 +94,7 @@ impl FilePane {
             filter: None,
             visible: Vec::new(),
             searching: false,
+            held: Vec::new(),
             status: None,
             hints: true,
             messages: true,
@@ -333,6 +340,12 @@ impl FilePane {
                 }
             },
 
+            // Pick something up to move it, or put it down again.
+            KeyCode::Char('x') => self.hold_highlighted(),
+            // Put down everything held, here. A capital, like the other keys that act on more than
+            // the highlighted row; `p` could not have it, being the player's previous track.
+            KeyCode::Char('M') => self.move_held_here(),
+
             // Queue what is highlighted: a track, or a whole folder.
             KeyCode::Char('a') => self.queue_highlighted(player),
             // Queue the lot: every track below this folder, or the whole playlist.
@@ -455,6 +468,94 @@ impl FilePane {
         self.status = Some(message.into());
     }
 
+    /// What is waiting to be moved.
+    pub fn held(&self) -> &[PathBuf] {
+        &self.held
+    }
+
+    /// Pick the highlighted row up, or put it down if it is already held.
+    ///
+    /// Holding changes nothing on disk: it only says what a later `p` will move. Several things can
+    /// be held at once, from as many folders as you like.
+    fn hold_highlighted(&mut self) {
+        if let Source::Playlist { .. } = self.source {
+            // A playlist is an order, not a folder: its rows are files that live elsewhere, and
+            // moving one from here would say nothing about where it is being moved from.
+            self.status = Some("open a folder to move files".to_string());
+            return;
+        }
+
+        let path = match self.highlighted() {
+            Some(Entry::File(song)) => song.path().to_path_buf(),
+            Some(Entry::Folder(path)) => path.clone(),
+            // `..` is the way out of the folder, not a thing in it.
+            Some(Entry::Parent(_)) | None => {
+                self.status = Some("nothing to move".to_string());
+                return;
+            }
+        };
+
+        if let Some(at) = self.held.iter().position(|held| *held == path) {
+            self.held.remove(at);
+            self.status = Some(format!("put down {}", name_of(&path)));
+
+            return;
+        }
+
+        self.held.push(path.clone());
+
+        self.status = Some(match self.held.len() {
+            1 => format!("holding {}", name_of(&path)),
+            count => format!("holding {count}"),
+        });
+    }
+
+    /// Move everything held into the folder being listed.
+    ///
+    /// Whatever cannot be moved stays held, so a second attempt somewhere else is one key away, and
+    /// the message says how many did not make it.
+    fn move_held_here(&mut self) {
+        if self.held.is_empty() {
+            self.status = Some("nothing held — x picks one up".to_string());
+            return;
+        }
+
+        if let Source::Playlist { .. } = self.source {
+            self.status = Some("open a folder to move into".to_string());
+            return;
+        }
+
+        let folder = self.cwd.clone();
+        let mut moved = 0;
+        let mut failed = Vec::new();
+        let mut last_error = None;
+
+        for path in std::mem::take(&mut self.held) {
+            match move_into(&path, &folder) {
+                Ok(()) => moved += 1,
+                Err(err) => {
+                    last_error = Some(err);
+                    failed.push(path);
+                }
+            }
+        }
+
+        self.held = failed;
+
+        // The listing is what the folder held a moment ago; the files in it have just changed.
+        let selected = self.state.selected();
+        self.open(&folder);
+        self.state.select(selected.filter(|index| *index < self.visible.len()).or(Some(0)));
+
+        self.status = Some(match (moved, last_error) {
+            (0, Some(err)) => err,
+            (0, None) => "nothing moved".to_string(),
+            (moved, Some(err)) => format!("moved {moved}, {} left: {err}", self.held.len()),
+            (1, None) => "moved 1 here".to_string(),
+            (moved, None) => format!("moved {moved} here"),
+        });
+    }
+
     /// Add whatever is highlighted to the queue.
     fn queue_highlighted(&mut self, player: &mut dyn Controls) {
         match self.highlighted().cloned() {
@@ -536,8 +637,19 @@ impl FilePane {
             .iter()
             .map(|index| &self.entries[*index])
             .map(|entry| {
+                let held = match entry {
+                    Entry::File(song) => self.held.iter().any(|path| path == song.path()),
+                    Entry::Folder(path) => self.held.contains(path),
+                    Entry::Parent(_) => false,
+                };
+
                 let line = match entry {
                     Entry::Parent(_) => Line::from("..").style(self.theme.muted()),
+                    Entry::Folder(path) if held => Line::from(vec![
+                        Span::from("✂ ").style(self.theme.accent()),
+                        Span::from(truncate(&name_of(path), width.saturating_sub(4)))
+                            .style(self.theme.accent()),
+                    ]),
                     Entry::Folder(path) => Line::from(vec![
                         Span::from("▸ ").style(self.theme.muted()),
                         Span::from(truncate(&name_of(path), width.saturating_sub(4)))
@@ -557,10 +669,17 @@ impl FilePane {
                             (None, None) => name_of(song.path()),
                         };
 
+                        // A held row says so in the margin, so what a `p` will move is visible
+                        // from the folder it is being moved into.
+                        let (mark, style) = if held {
+                            ("✂ ", self.theme.accent())
+                        } else {
+                            ("  ", self.theme.muted())
+                        };
+
                         Line::from(vec![
-                            Span::from("  "),
-                            Span::from(truncate(&label, width.saturating_sub(4)))
-                                .style(self.theme.muted()),
+                            Span::from(mark).style(self.theme.accent()),
+                            Span::from(truncate(&label, width.saturating_sub(4))).style(style),
                         ])
                     }
                 };
@@ -626,13 +745,90 @@ impl FilePane {
                 ],
                 Source::Folder => [
                     Line::from("a queue · A all · P playlist").style(self.theme.muted()),
-                    Line::from("enter open · bksp up · / find").style(self.theme.muted()),
+                    Line::from("enter open · bksp up · / find · x hold · M move")
+                        .style(self.theme.muted()),
                 ],
             }
         };
 
         frame.render_widget(ratatui::widgets::Paragraph::new(keys.to_vec()), keys_area);
     }
+}
+
+/// Move `source` into `folder`, keeping its name.
+///
+/// Nothing is ever overwritten: a name already taken in the target folder is refused rather than
+/// resolved, since the two files with one name are the user's to sort out, not this pane's.
+fn move_into(source: &Path, folder: &Path) -> Result<(), String> {
+    let name = source.file_name().ok_or_else(|| format!("{} has no name", source.display()))?;
+
+    if !source.exists() {
+        return Err(format!("gone: {}", name_of(source)));
+    }
+
+    if source.parent() == Some(folder) {
+        return Err(format!("already here: {}", name_of(source)));
+    }
+
+    // Moving a folder into itself, or into something inside it, would move the target along with
+    // it — the rename either fails obscurely or takes the folder somewhere it cannot be reached.
+    if folder == source || folder.starts_with(source) {
+        return Err(format!("cannot hold itself: {}", name_of(source)));
+    }
+
+    let target = folder.join(name);
+
+    if target.exists() {
+        return Err(format!("already there: {}", name_of(source)));
+    }
+
+    match std::fs::rename(source, &target) {
+        Ok(()) => Ok(()),
+        // Another filesystem: a rename cannot span one, so the bytes have to be carried over and
+        // the original removed once they are all there.
+        Err(err) if err.raw_os_error() == Some(CROSS_DEVICE) => {
+            copy_across(source, &target).map_err(|err| format!("{}: {err}", name_of(source)))
+        }
+        Err(err) => Err(format!("{}: {err}", name_of(source))),
+    }
+}
+
+/// `EXDEV`: a rename whose two ends are on different filesystems.
+const CROSS_DEVICE: i32 = 18;
+
+/// Copy `source` to `target` and remove the original, for a move between filesystems.
+///
+/// The original goes only once the copy is complete, so an interrupted move leaves the file where
+/// it was rather than nowhere at all.
+fn copy_across(source: &Path, target: &Path) -> std::io::Result<()> {
+    if source.is_dir() {
+        copy_tree(source, target)?;
+
+        return std::fs::remove_dir_all(source);
+    }
+
+    std::fs::copy(source, target)?;
+
+    std::fs::remove_file(source)
+}
+
+/// Copy a folder and everything below it.
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let source = entry.path();
+        let target = to.join(entry.file_name());
+
+        if entry.file_type()?.is_dir() {
+            copy_tree(&source, &target)?;
+        } else {
+            std::fs::copy(&source, &target)?;
+        }
+    }
+
+    Ok(())
 }
 
 /// The last component of a path, for display.

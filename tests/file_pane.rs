@@ -551,3 +551,178 @@ fn opening_a_folder_leaves_the_search_behind() {
     assert_eq!(pane.cwd(), root.join("chopin-box-set"));
     assert_eq!(pane.filter(), None, "a new listing starts unnarrowed");
 }
+
+// --------------------------------------------------------------------------- moving files about
+
+#[test]
+fn x_picks_a_file_up_and_p_puts_it_down_in_another_folder() {
+    let root = tree("pane-move");
+    let mut pane = FilePane::at(&root);
+    let mut player = Player::new();
+
+    // Down past `..` and the album folder, onto the first track.
+    press(&mut pane, &mut player, KeyCode::Char('g'));
+    for _ in 0..2 {
+        press(&mut pane, &mut player, KeyCode::Down);
+    }
+
+    press(&mut pane, &mut player, KeyCode::Char('x'));
+    assert_eq!(pane.held().len(), 1, "one file is held");
+    assert!(render(&mut pane, true).contains('✂'), "and the row says so");
+
+    // Into the album folder, and put it down.
+    press(&mut pane, &mut player, KeyCode::Char('g'));
+    press(&mut pane, &mut player, KeyCode::Down);
+    press(&mut pane, &mut player, KeyCode::Enter);
+    assert_eq!(pane.cwd(), root.join("album"));
+
+    press(&mut pane, &mut player, KeyCode::Char('M'));
+
+    assert!(root.join("album").join("a-first.mp3").is_file(), "the file moved");
+    assert!(!root.join("a-first.mp3").exists(), "and is no longer where it was");
+    assert!(pane.held().is_empty(), "nothing is still held");
+
+    let frame = render(&mut pane, true);
+    assert!(frame.contains("moved 1 here"), "{frame}");
+    assert!(frame.contains("a-first"), "and the listing shows it: {frame}");
+}
+
+#[test]
+fn x_twice_puts_the_file_back_down_without_moving_it() {
+    let root = tree("pane-unhold");
+    let mut pane = FilePane::at(&root);
+    let mut player = Player::new();
+
+    press(&mut pane, &mut player, KeyCode::Char('g'));
+    press(&mut pane, &mut player, KeyCode::Down);
+    press(&mut pane, &mut player, KeyCode::Down);
+
+    press(&mut pane, &mut player, KeyCode::Char('x'));
+    press(&mut pane, &mut player, KeyCode::Char('x'));
+
+    assert!(pane.held().is_empty());
+    assert!(render(&mut pane, true).contains("put down"));
+}
+
+#[test]
+fn several_files_move_at_once() {
+    let root = tree("pane-move-several");
+    let mut pane = FilePane::at(&root);
+    let mut player = Player::new();
+
+    // Both tracks in the root.
+    press(&mut pane, &mut player, KeyCode::Char('g'));
+    press(&mut pane, &mut player, KeyCode::Down);
+    press(&mut pane, &mut player, KeyCode::Down);
+    press(&mut pane, &mut player, KeyCode::Char('x'));
+    press(&mut pane, &mut player, KeyCode::Down);
+    press(&mut pane, &mut player, KeyCode::Char('x'));
+    assert_eq!(pane.held().len(), 2);
+
+    press(&mut pane, &mut player, KeyCode::Char('g'));
+    press(&mut pane, &mut player, KeyCode::Down);
+    press(&mut pane, &mut player, KeyCode::Enter);
+    press(&mut pane, &mut player, KeyCode::Char('M'));
+
+    assert!(root.join("album").join("a-first.mp3").is_file());
+    assert!(root.join("album").join("b-second.flac").is_file());
+    assert!(render(&mut pane, true).contains("moved 2 here"));
+}
+
+#[test]
+fn a_whole_folder_can_be_moved() {
+    let root = tree("pane-move-folder");
+    std::fs::create_dir_all(root.join("elsewhere")).expect("create folder");
+
+    let mut pane = FilePane::at(&root);
+    let mut player = Player::new();
+
+    // The album folder, held.
+    press(&mut pane, &mut player, KeyCode::Char('g'));
+    press(&mut pane, &mut player, KeyCode::Down);
+    press(&mut pane, &mut player, KeyCode::Char('x'));
+
+    // Into `elsewhere`, which sorts after `album`.
+    press(&mut pane, &mut player, KeyCode::Down);
+    press(&mut pane, &mut player, KeyCode::Enter);
+    assert_eq!(pane.cwd(), root.join("elsewhere"));
+
+    press(&mut pane, &mut player, KeyCode::Char('M'));
+
+    assert!(root.join("elsewhere").join("album").join("01.opus").is_file(), "it moved whole");
+    assert!(!root.join("album").exists());
+}
+
+#[test]
+fn a_name_already_taken_is_refused_and_the_file_stays_held() {
+    let root = tree("pane-move-clash");
+    std::fs::write(root.join("album").join("a-first.mp3"), b"already here").expect("write file");
+
+    let mut pane = FilePane::at(&root);
+    let mut player = Player::new();
+
+    press(&mut pane, &mut player, KeyCode::Char('g'));
+    press(&mut pane, &mut player, KeyCode::Down);
+    press(&mut pane, &mut player, KeyCode::Down);
+    press(&mut pane, &mut player, KeyCode::Char('x'));
+
+    press(&mut pane, &mut player, KeyCode::Char('g'));
+    press(&mut pane, &mut player, KeyCode::Down);
+    press(&mut pane, &mut player, KeyCode::Enter);
+    press(&mut pane, &mut player, KeyCode::Char('M'));
+
+    assert_eq!(pane.held().len(), 1, "it is still held, to put down somewhere else");
+    assert!(root.join("a-first.mp3").is_file(), "and has not moved");
+
+    let frame = render(&mut pane, true);
+    assert!(frame.contains("already there"), "{frame}");
+
+    // What was there is untouched.
+    let kept = std::fs::read(root.join("album").join("a-first.mp3")).expect("read");
+    assert_eq!(kept, b"already here");
+}
+
+#[test]
+fn a_folder_cannot_be_moved_into_itself() {
+    let root = tree("pane-move-into-itself");
+    let mut pane = FilePane::at(&root);
+    let mut player = Player::new();
+
+    press(&mut pane, &mut player, KeyCode::Char('g'));
+    press(&mut pane, &mut player, KeyCode::Down);
+    press(&mut pane, &mut player, KeyCode::Char('x'));
+    press(&mut pane, &mut player, KeyCode::Enter);
+    assert_eq!(pane.cwd(), root.join("album"));
+
+    press(&mut pane, &mut player, KeyCode::Char('M'));
+
+    assert!(root.join("album").join("01.opus").is_file(), "the folder is where it was");
+    assert!(render(&mut pane, true).contains("cannot hold itself"));
+}
+
+#[test]
+fn moving_with_nothing_held_says_what_to_press() {
+    let root = tree("pane-move-nothing");
+    let mut pane = FilePane::at(&root);
+    let mut player = Player::new();
+
+    press(&mut pane, &mut player, KeyCode::Char('M'));
+
+    assert!(render(&mut pane, true).contains("nothing held"));
+}
+
+#[test]
+fn putting_a_file_down_where_it_already_is_changes_nothing() {
+    let root = tree("pane-move-same-folder");
+    let mut pane = FilePane::at(&root);
+    let mut player = Player::new();
+
+    press(&mut pane, &mut player, KeyCode::Char('g'));
+    press(&mut pane, &mut player, KeyCode::Down);
+    press(&mut pane, &mut player, KeyCode::Down);
+    press(&mut pane, &mut player, KeyCode::Char('x'));
+    press(&mut pane, &mut player, KeyCode::Char('M'));
+
+    assert!(root.join("a-first.mp3").is_file());
+    assert!(render(&mut pane, true).contains("already here"));
+}
