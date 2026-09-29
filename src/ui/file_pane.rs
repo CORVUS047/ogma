@@ -1,9 +1,22 @@
-//! Browsing the files themselves, to pick what goes into the queue.
+//! The multimodal panel: the listing the queue is filled from, in whichever mode is showing.
 //!
 //! Sits under the playlists in the left column. Unlike the folder browser that chooses a library
 //! root, this one lists the music as well as the folders, so individual tracks can be queued.
+//!
+//! Four things to list, `m` cycling between the first three, and the border says which:
+//!
+//! * **files** — the folder on disk, which is where it opens;
+//! * **browse** — everything below that folder grouped under one tag at a time, so a library can be
+//!   walked by artist or genre rather than by path. See [`crate::browse`];
+//! * **youtube** — what a search turned up, to stream or to download. See [`crate::ytdl`];
+//! * **playlist** — a playlist's own order, which the playlists pane opens.
+//!
+//! The rows are the same kind of thing in every mode, which is the point of the panel being one
+//! pane rather than the search having a screen of its own: `a` queues, `P` sends to the selected playlist, and
+//! enter plays, whether the row came from the disk or from YouTube.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, TryRecvError};
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -12,12 +25,14 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, List, ListItem, ListState, Padding};
 
+use crate::browse::{self, Facet};
 use crate::library;
 use crate::meta;
 use crate::player::Controls;
 use crate::playlist::Playlist;
 use crate::song::Song;
 use crate::theme::Theme;
+use crate::ytdl::{self, Event, Format, Track};
 
 /// What one row of the listing is.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -27,25 +42,63 @@ enum Entry {
     /// A folder that can be entered, or queued whole.
     Folder(PathBuf),
     /// A track. Holds the song rather than the path so that reading its tags for display happens
-    /// once rather than once per frame.
+    /// once rather than once per frame. A YouTube result is a track like any other, one that plays
+    /// from the network.
     File(Song),
+    /// Everything filed under one artist, album, genre or year, in browse mode.
+    Group { value: String, songs: Vec<Song> },
 }
 
 /// What the pane is listing.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Source {
+enum Mode {
     /// A folder on disk.
     Folder,
     /// A playlist's tracks, in the playlist's own order.
     Playlist { name: String, detail: String },
+    /// What is below the folder, grouped under one tag: the groups, or one group's tracks.
+    Browse { facet: Facet, group: Option<String> },
+    /// What a YouTube search turned up.
+    Youtube,
+}
+
+impl Mode {
+    /// The modes `m` moves between, in order.
+    ///
+    /// A playlist is not among them: it is opened from the playlists pane rather than cycled into,
+    /// and `m` leaves it for the folder it came from.
+    const CYCLED: [Mode; 3] = [
+        Mode::Folder,
+        Mode::Browse { facet: Facet::Artist, group: None },
+        Mode::Youtube,
+    ];
+
+    /// Which of the cycled modes this is, ignoring where it has been walked to within one.
+    fn family(&self) -> usize {
+        match self {
+            Mode::Folder | Mode::Playlist { .. } => 0,
+            Mode::Browse { .. } => 1,
+            Mode::Youtube => 2,
+        }
+    }
+
+    /// The mode `m` moves on to.
+    fn next(&self) -> Mode {
+        match self {
+            // Leaving a playlist goes back to the files rather than onwards, since a playlist is
+            // something that was opened on top of them.
+            Mode::Playlist { .. } => Mode::Folder,
+            other => Mode::CYCLED[(other.family() + 1) % Mode::CYCLED.len()].clone(),
+        }
+    }
 }
 
 /// A file listing, and where the user is in it.
 #[derive(Debug)]
 pub struct FilePane {
-    /// The folder being listed, and the one to come back to after looking at a playlist.
+    /// The folder being listed, and the one to come back to after looking at anything else.
     cwd: PathBuf,
-    source: Source,
+    mode: Mode,
     entries: Vec<Entry>,
     state: ListState,
     /// What the last action did, shown under the listing.
@@ -56,7 +109,37 @@ pub struct FilePane {
     visible: Vec<usize>,
     /// Whether keys are going into the search rather than into the listing.
     searching: bool,
-    /// Files and folders picked up with `x`, waiting to be put down somewhere with `p`.
+    /// What has been typed into the YouTube query, while it is being typed.
+    typing_query: Option<String>,
+    /// The query the results on screen came from.
+    query: String,
+    /// What the last YouTube search turned up, as songs that play from the network.
+    results: Vec<Song>,
+    /// A YouTube search in flight, if one is.
+    asking: Option<Receiver<Result<Vec<Track>, String>>>,
+    /// A download in flight, if one is.
+    downloading: Option<Receiver<Event>>,
+    /// What the running download is on, and how far it has got.
+    progress: Option<(String, f32)>,
+    /// The tags of everything below [`FilePane::browse_root`], once they have been read.
+    indexed: Vec<Song>,
+    /// The folder the index was built from, so walking somewhere else rebuilds it.
+    browse_root: Option<PathBuf>,
+    /// An index being built, if one is.
+    indexing: Option<Receiver<Vec<Song>>>,
+    /// How many results a YouTube search asks for, from the config.
+    search_results: usize,
+    /// What a downloaded track is kept as, from the config.
+    download_format: Format,
+    /// Where downloads are written, from the config.
+    download_folder: PathBuf,
+    /// Whether what was drawn last should be thrown away rather than drawn over.
+    ///
+    /// Only the cells that change are written, which a wide character or an emoji — both common in
+    /// YouTube titles — can leave half of behind. Leaving a listing full of them asks for a clean
+    /// slate instead.
+    repaint: bool,
+    /// Files and folders picked up with `x`, waiting to be put down somewhere with `M`.
     ///
     /// Held as absolute paths rather than as positions in the listing: the point of holding
     /// something is to walk somewhere else before putting it down, and the listing changes on the
@@ -88,12 +171,25 @@ impl FilePane {
     pub fn at(path: &Path) -> Self {
         let mut pane = FilePane {
             cwd: PathBuf::new(),
-            source: Source::Folder,
+            mode: Mode::Folder,
             entries: Vec::new(),
             state: ListState::default(),
             filter: None,
             visible: Vec::new(),
             searching: false,
+            typing_query: None,
+            query: String::new(),
+            results: Vec::new(),
+            asking: None,
+            downloading: None,
+            progress: None,
+            indexed: Vec::new(),
+            browse_root: None,
+            indexing: None,
+            search_results: ytdl::DEFAULT_RESULTS,
+            download_format: Format::default(),
+            download_folder: default_download_folder(),
+            repaint: false,
             held: Vec::new(),
             status: None,
             hints: true,
@@ -120,16 +216,93 @@ impl FilePane {
         self.messages = messages;
     }
 
+    /// How many results a YouTube search should ask for.
+    pub fn set_search_results(&mut self, count: usize) {
+        self.search_results = count;
+    }
+
+    /// What a downloaded track should be kept as.
+    pub fn set_download_format(&mut self, format: Format) {
+        self.download_format = format;
+    }
+
+    /// Where downloads should be written.
+    pub fn set_download_folder(&mut self, folder: PathBuf) {
+        self.download_folder = folder;
+    }
+
+    /// Where downloads are written.
+    pub fn download_folder(&self) -> &Path {
+        &self.download_folder
+    }
+
+    /// Take in whatever the background work has finished with.
+    ///
+    /// Reading a folder's tags, asking YouTube and fetching a track all happen on threads of their
+    /// own; this is where what they did arrives. Called on every tick, and never blocks.
+    pub fn poll(&mut self) {
+        self.collect_index();
+        self.collect_search();
+        self.collect_download();
+    }
+
+    /// Whether what was drawn last should be cleared rather than drawn over, taking the flag.
+    ///
+    /// Set when the listing changes to something of a different kind. A wide character or an emoji
+    /// takes two cells, and a terminal told to overwrite half of one can leave the other half
+    /// showing; YouTube titles are full of them, so the screen it was listed on is thrown away
+    /// rather than written over.
+    pub fn take_repaint(&mut self) -> bool {
+        std::mem::take(&mut self.repaint)
+    }
+
     /// The folder being listed, or the folder a playlist view will return to.
     pub fn cwd(&self) -> &Path {
         &self.cwd
     }
 
+    /// What the pane is listing, in a word: `files`, `browse`, `youtube` or `playlist`.
+    pub fn mode_name(&self) -> &'static str {
+        match self.mode {
+            Mode::Folder => "files",
+            Mode::Playlist { .. } => "playlist",
+            Mode::Browse { .. } => "browse",
+            Mode::Youtube => "youtube",
+        }
+    }
+
+    /// What the pane is called while it is in this mode.
+    ///
+    /// The border says which of the four is showing, so a pane full of artist names is not read as
+    /// a folder full of them. What is being listed within the mode — the folder, the group, the
+    /// query — is the line under the border, not this.
+    fn title(&self) -> &'static str {
+        match self.mode {
+            Mode::Folder => " Files ",
+            Mode::Playlist { .. } => " Playlist ",
+            Mode::Browse { .. } => " Browse ",
+            Mode::Youtube => " YouTube ",
+        }
+    }
+
+    /// What the browse mode is grouping tracks under, when that is what is showing.
+    pub fn facet(&self) -> Option<Facet> {
+        match self.mode {
+            Mode::Browse { facet, .. } => Some(facet),
+            _ => None,
+        }
+    }
+
+    /// What a YouTube search turned up, as songs that play from the network.
+    pub fn results(&self) -> &[Song] {
+        &self.results
+    }
+
     /// The playlist being listed, if a playlist is open rather than a folder.
     pub fn open_playlist(&self) -> Option<&str> {
-        match &self.source {
-            Source::Playlist { name, .. } => Some(name),
-            Source::Folder => None,
+        match &self.mode {
+            Mode::Playlist { name, .. } => Some(name),
+            _ => None,
         }
     }
 
@@ -151,9 +324,11 @@ impl FilePane {
             if playlist.descending() { " ↓" } else { "" }
         );
 
-        self.source = Source::Playlist { name: playlist.name().to_string(), detail };
+        self.mode = Mode::Playlist { name: playlist.name().to_string(), detail };
         self.filter = None;
         self.searching = false;
+        self.typing_query = None;
+        self.repaint = true;
         self.state.select(Some(0));
         self.apply_filter();
         self.status = if playlist.is_empty() {
@@ -167,7 +342,7 @@ impl FilePane {
     pub fn show_folder(&mut self) {
         let cwd = self.cwd.clone();
 
-        self.source = Source::Folder;
+        self.mode = Mode::Folder;
         self.open(&cwd);
     }
 
@@ -175,10 +350,10 @@ impl FilePane {
         self.entries.get(*self.visible.get(self.state.selected()?)?)
     }
 
-    /// Whether keys are being typed into the search, in which case the screen must not treat them as
-    /// commands.
+    /// Whether keys are being typed — into the filter, or into a YouTube query — in which case the
+    /// screen must not treat them as commands.
     pub fn is_typing(&self) -> bool {
-        self.searching
+        self.searching || self.typing_query.is_some()
     }
 
     /// What the search is narrowing the listing to, if anything.
@@ -199,6 +374,7 @@ impl FilePane {
                 (None, Some(title)) => title.to_string(),
                 (None, None) => name_of(song.path()),
             },
+            Entry::Group { value, songs } => format!("{value} ({})", songs.len()),
         }
     }
 
@@ -271,7 +447,7 @@ impl FilePane {
         entries.extend(files.into_iter().map(Entry::File));
 
         self.cwd = target;
-        self.source = Source::Folder;
+        self.mode = Mode::Folder;
         self.entries = entries;
         self.status = None;
         // A new folder is a fresh listing: carrying a search into it would hide most of it without
@@ -300,7 +476,17 @@ impl FilePane {
             return self.handle_search_key(key);
         }
 
+        if self.typing_query.is_some() {
+            return self.handle_query_key(key);
+        }
+
         match key.code {
+            // Ask YouTube something. The listing here is already the answer to a question, so `/`
+            // asks a new one rather than narrowing the last.
+            KeyCode::Char('/') if self.mode == Mode::Youtube => {
+                self.typing_query = Some(self.query.clone());
+            }
+
             // Narrow the listing to what is typed.
             KeyCode::Char('/') => {
                 self.searching = true;
@@ -318,9 +504,10 @@ impl FilePane {
             KeyCode::PageDown => self.state.scroll_down_by(10),
             KeyCode::PageUp => self.state.scroll_up_by(10),
 
-            // Entering a folder, or starting a track straight away.
+            // Entering a folder or a group, or starting a track straight away.
             KeyCode::Enter => match self.highlighted().cloned() {
                 Some(Entry::Parent(path) | Entry::Folder(path)) => self.open(&path),
+                Some(Entry::Group { value, .. }) => self.open_group(&value),
                 Some(Entry::File(song)) => {
                     let title = song.display_title();
 
@@ -330,15 +517,28 @@ impl FilePane {
                 None => {}
             },
 
-            // Out of a playlist first, since that is what the listing is showing.
-            KeyCode::Backspace => match self.source {
-                Source::Playlist { .. } => self.show_folder(),
-                Source::Folder => {
+            // Back out of whatever the listing is showing, a step at a time: out of a group to
+            // the groups, out of anything else to the folder, and up out of the folder itself.
+            KeyCode::Backspace => match self.mode.clone() {
+                Mode::Playlist { .. } | Mode::Youtube => self.show_folder(),
+                Mode::Browse { facet, group: Some(_) } => {
+                    self.mode = Mode::Browse { facet, group: None };
+                    self.rebuild();
+                }
+                Mode::Browse { .. } => self.show_folder(),
+                Mode::Folder => {
                     if let Some(parent) = self.cwd.parent().map(Path::to_path_buf) {
                         self.open(&parent);
                     }
                 }
             },
+
+            // Round the modes: files, browse, youtube.
+            KeyCode::Char('m') => self.cycle_mode(),
+            // What the browse mode files tracks under.
+            KeyCode::Char('t') if matches!(self.mode, Mode::Browse { .. }) => self.cycle_facet(),
+            // Keep the chosen results rather than streaming them.
+            KeyCode::Char('d') if self.mode == Mode::Youtube => self.download_chosen(),
 
             // Pick something up to move it, or put it down again.
             KeyCode::Char('x') => self.hold_highlighted(),
@@ -349,7 +549,7 @@ impl FilePane {
             // Queue what is highlighted: a track, or a whole folder.
             KeyCode::Char('a') => self.queue_highlighted(player),
             // Queue the lot: every track below this folder, or the whole playlist.
-            KeyCode::Char('A') => match &self.source {
+            KeyCode::Char('A') => match &self.mode {
                 // A narrowed listing means the matches, not everything: queuing what is not on
                 // screen would be a surprise.
                 _ if self.filter.is_some() => {
@@ -358,16 +558,23 @@ impl FilePane {
                     self.status = Some(format!("queued {} matching", songs.len()));
                     player.add_queue_all(songs);
                 }
-                Source::Playlist { name, .. } => {
+                Mode::Playlist { name, .. } => {
                     let name = name.clone();
                     let songs: Vec<Song> = self.songs_listed();
 
                     self.status = Some(format!("queued {} from {name}", songs.len()));
                     player.add_queue_all(songs);
                 }
-                Source::Folder => {
+                Mode::Folder => {
                     let cwd = self.cwd.clone();
                     self.queue_path(player, &cwd);
+                }
+                // A grouped listing, or a page of results: what is on screen is what there is.
+                Mode::Browse { .. } | Mode::Youtube => {
+                    let songs: Vec<Song> = self.songs_listed();
+
+                    self.status = Some(format!("queued {}", songs.len()));
+                    player.add_queue_all(songs);
                 }
             },
 
@@ -448,6 +655,9 @@ impl FilePane {
         match self.highlighted() {
             Some(Entry::File(song)) => vec![song.clone()],
             Some(Entry::Folder(path)) => library::scan(path),
+            // A group stands for its tracks, so queueing or sending one to a playlist takes the
+            // lot — the same as a folder does.
+            Some(Entry::Group { songs, .. }) => songs.clone(),
             Some(Entry::Parent(_)) | None => Vec::new(),
         }
     }
@@ -478,7 +688,7 @@ impl FilePane {
     /// Holding changes nothing on disk: it only says what a later `p` will move. Several things can
     /// be held at once, from as many folders as you like.
     fn hold_highlighted(&mut self) {
-        if let Source::Playlist { .. } = self.source {
+        if let Mode::Playlist { .. } = self.mode {
             // A playlist is an order, not a folder: its rows are files that live elsewhere, and
             // moving one from here would say nothing about where it is being moved from.
             self.status = Some("open a folder to move files".to_string());
@@ -486,6 +696,16 @@ impl FilePane {
         }
 
         let path = match self.highlighted() {
+            // A track that plays from the network is not a file, and a group is not a folder:
+            // neither is something the filesystem can be asked to move.
+            Some(Entry::File(song)) if song.is_stream() => {
+                self.status = Some("a stream is not a file".to_string());
+                return;
+            }
+            Some(Entry::Group { .. }) => {
+                self.status = Some("open the group to move its tracks".to_string());
+                return;
+            }
             Some(Entry::File(song)) => song.path().to_path_buf(),
             Some(Entry::Folder(path)) => path.clone(),
             // `..` is the way out of the folder, not a thing in it.
@@ -520,7 +740,7 @@ impl FilePane {
             return;
         }
 
-        if let Source::Playlist { .. } = self.source {
+        if let Mode::Playlist { .. } = self.mode {
             self.status = Some("open a folder to move into".to_string());
             return;
         }
@@ -556,6 +776,326 @@ impl FilePane {
         });
     }
 
+    // ------------------------------------------------------------------------------ the modes
+
+    /// Move to the next mode: files, browse, youtube, round again.
+    fn cycle_mode(&mut self) {
+        let next = self.mode.next();
+        self.enter_mode(next);
+    }
+
+    /// Show `mode`, doing whatever it needs before it can be listed.
+    fn enter_mode(&mut self, mode: Mode) {
+        // A listing of one kind of thing has no business being narrowed by a search for another.
+        self.filter = None;
+        self.searching = false;
+        self.typing_query = None;
+        // Leaving a listing of YouTube titles is where the half-drawn wide characters come from.
+        self.repaint = true;
+
+        match mode {
+            Mode::Folder => {
+                let cwd = self.cwd.clone();
+                self.mode = Mode::Folder;
+                self.open(&cwd);
+            }
+            Mode::Browse { facet, .. } => {
+                self.mode = Mode::Browse { facet, group: None };
+                self.start_index();
+                self.rebuild();
+            }
+            Mode::Youtube => {
+                self.mode = Mode::Youtube;
+
+                // The keys stay the pane's until `/` is pressed: arriving in a mode should not
+                // mean every key that follows is swallowed by a text field nobody asked for.
+                self.rebuild();
+
+                self.status = match ytdl::missing() {
+                    Some(missing) => Some(missing),
+                    None if self.results.is_empty() => Some("press / to search".to_string()),
+                    None => None,
+                };
+            }
+            Mode::Playlist { .. } => self.mode = mode,
+        }
+    }
+
+    /// Group the tracks under the next tag along.
+    fn cycle_facet(&mut self) {
+        let Mode::Browse { facet, .. } = &self.mode else {
+            return;
+        };
+
+        let facet = facet.next();
+
+        // Back to the list of groups: the group that was open belongs to the old grouping.
+        self.mode = Mode::Browse { facet, group: None };
+        self.status = Some(format!("by {}", facet.label()));
+        self.rebuild();
+    }
+
+    /// Show the tracks filed under `value`.
+    fn open_group(&mut self, value: &str) {
+        let Mode::Browse { facet, .. } = &self.mode else {
+            return;
+        };
+
+        self.mode = Mode::Browse { facet: *facet, group: Some(value.to_string()) };
+        self.filter = None;
+        self.rebuild();
+    }
+
+    /// Build the listing the current mode calls for.
+    ///
+    /// The folder builds its own listing as it opens it, and a playlist is handed one; this is for
+    /// the two modes whose rows come from something the pane is holding.
+    fn rebuild(&mut self) {
+        match self.mode.clone() {
+            Mode::Browse { facet, group } => {
+                let grouped = browse::group(&self.indexed, facet);
+
+                self.entries = match group {
+                    Some(wanted) => grouped
+                        .into_iter()
+                        .find(|group| group.value == wanted)
+                        .map(|group| group.songs.into_iter().map(Entry::File).collect())
+                        .unwrap_or_default(),
+                    None => grouped
+                        .into_iter()
+                        .map(|group| Entry::Group { value: group.value, songs: group.songs })
+                        .collect(),
+                };
+            }
+            Mode::Youtube => {
+                self.entries = self.results.iter().cloned().map(Entry::File).collect();
+            }
+            Mode::Folder | Mode::Playlist { .. } => return,
+        }
+
+        self.state.select((!self.entries.is_empty()).then_some(0));
+        self.apply_filter();
+    }
+
+    // ---------------------------------------------------------------------------- browsing tags
+
+    /// Start reading the tags of everything below the folder, unless that is already done.
+    ///
+    /// Reading a library's tags takes long enough to be worth saying so, and long enough that it
+    /// cannot happen on the drawing thread. What comes back is kept until the folder changes.
+    fn start_index(&mut self) {
+        if self.browse_root.as_deref() == Some(self.cwd.as_path()) || self.indexing.is_some() {
+            return;
+        }
+
+        self.browse_root = Some(self.cwd.clone());
+        self.indexed = Vec::new();
+        self.indexing = Some(browse::index_in_background(self.cwd.clone()));
+        self.status = Some("reading tags…".to_string());
+    }
+
+    /// Take in an index that has finished being built.
+    fn collect_index(&mut self) {
+        let Some(indexing) = &self.indexing else {
+            return;
+        };
+
+        match indexing.try_recv() {
+            Ok(songs) => {
+                self.indexing = None;
+                let count = songs.len();
+                self.indexed = songs;
+                self.rebuild();
+
+                self.status = Some(match count {
+                    0 => "no music below this folder".to_string(),
+                    1 => "1 track".to_string(),
+                    count => format!("{count} tracks"),
+                });
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.indexing = None;
+                self.status = Some("could not read the folder".to_string());
+            }
+        }
+    }
+
+    // --------------------------------------------------------------------------------- youtube
+
+    /// Keys while the query is being typed.
+    fn handle_query_key(&mut self, key: KeyEvent) -> bool {
+        let Some(query) = &mut self.typing_query else {
+            return false;
+        };
+
+        match key.code {
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => query.clear(),
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => query.push(c),
+            KeyCode::Backspace => {
+                query.pop();
+            }
+            KeyCode::Enter => {
+                let query = query.clone();
+                self.start_search(query);
+            }
+            // Out of the query, leaving whatever was found last on screen.
+            KeyCode::Esc => self.typing_query = None,
+            _ => {}
+        }
+
+        true
+    }
+
+    /// Ask YouTube for `query`, on a thread of its own.
+    fn start_search(&mut self, query: String) {
+        let query = query.trim().to_string();
+        self.typing_query = None;
+
+        if query.is_empty() {
+            self.status = Some("nothing to search for".to_string());
+            return;
+        }
+
+        if let Some(missing) = ytdl::missing() {
+            self.status = Some(missing);
+            return;
+        }
+
+        self.query = query.clone();
+        self.status = Some(format!("searching for {query}…"));
+        self.asking = Some(ytdl::search_in_background(query, self.search_results));
+    }
+
+    /// Take in what a search turned up.
+    fn collect_search(&mut self) {
+        let Some(asking) = &self.asking else {
+            return;
+        };
+
+        match asking.try_recv() {
+            Ok(Ok(results)) => {
+                self.asking = None;
+                let count = results.len();
+
+                self.results = results.iter().map(Track::song).collect();
+                self.rebuild();
+
+                self.status = Some(match count {
+                    0 => "nothing found".to_string(),
+                    1 => "1 result".to_string(),
+                    count => format!("{count} results"),
+                });
+            }
+            Ok(Err(err)) => {
+                self.asking = None;
+                self.status = Some(err);
+            }
+            Err(TryRecvError::Empty) => {}
+            // The thread went away without answering, which is the spawn having failed.
+            Err(TryRecvError::Disconnected) => {
+                self.asking = None;
+                self.status = Some("the search could not be started".to_string());
+            }
+        }
+    }
+
+    /// Download what is highlighted, rather than streaming it.
+    fn download_chosen(&mut self) {
+        if self.downloading.is_some() {
+            self.status = Some("a download is already running".to_string());
+            return;
+        }
+
+        // Whatever the listing would queue is what it downloads, so the two keys agree about what
+        // they are acting on.
+        let songs = self.highlighted_songs();
+        let tracks: Vec<Track> = songs.iter().filter_map(Track::of).collect();
+
+        if tracks.is_empty() {
+            self.status = Some("nothing to download".to_string());
+            return;
+        }
+
+        if let Some(missing) = ytdl::missing() {
+            self.status = Some(missing);
+            return;
+        }
+
+        // The folder has to exist before yt-dlp is pointed at it, and saying why it could not be
+        // made is more use than a download that fails a second later.
+        if let Err(err) = std::fs::create_dir_all(&self.download_folder) {
+            self.status = Some(format!("cannot use {}: {err}", self.download_folder.display()));
+            return;
+        }
+
+        let count = tracks.len();
+        self.downloading = Some(ytdl::download_in_background(
+            tracks,
+            self.download_folder.clone(),
+            self.download_format,
+        ));
+        self.status = Some(format!("downloading {count} to {}", self.download_folder.display()));
+    }
+
+    /// Take in whatever a running download has to say.
+    fn collect_download(&mut self) {
+        let Some(downloading) = &self.downloading else {
+            return;
+        };
+
+        // Taken out of the channel first and acted on after: the events say things about the pane,
+        // which cannot be changed while the channel it is holding is borrowed.
+        let mut events = Vec::new();
+        let mut ended = false;
+
+        loop {
+            match downloading.try_recv() {
+                Ok(event) => {
+                    ended |= event == Event::Done;
+                    events.push(event);
+
+                    if ended {
+                        break;
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    ended = true;
+                    break;
+                }
+            }
+        }
+
+        for event in events {
+            match event {
+                Event::Started { title, index, total } => {
+                    self.progress = Some((title.clone(), 0.0));
+                    self.status = Some(format!("{index}/{total} {title}"));
+                }
+                Event::Progress { percent } => {
+                    if let Some((_, done)) = self.progress.as_mut() {
+                        *done = percent;
+                    }
+                }
+                Event::Finished { title, .. } => {
+                    self.progress = None;
+                    self.status = Some(format!("saved {title}"));
+                }
+                Event::Failed { title, error } => {
+                    self.progress = None;
+                    self.status = Some(format!("{title}: {error}"));
+                }
+                Event::Done => {}
+            }
+        }
+
+        if ended {
+            self.downloading = None;
+            self.progress = None;
+        }
+    }
+
     /// Add whatever is highlighted to the queue.
     fn queue_highlighted(&mut self, player: &mut dyn Controls) {
         match self.highlighted().cloned() {
@@ -564,6 +1104,12 @@ impl FilePane {
 
                 player.add_queue(song);
                 self.status = Some(format!("queued {title}"));
+            }
+            Some(Entry::Group { value, songs }) => {
+                let count = songs.len();
+
+                player.add_queue_all(songs);
+                self.status = Some(format!("queued {count} from {value}"));
             }
             Some(Entry::Folder(path)) => self.queue_path(player, &path),
             // `..` is a way out of the folder, not a thing to queue: queuing it would sweep in
@@ -588,11 +1134,49 @@ impl FilePane {
         player.add_queue_all(songs);
     }
 
+    /// The key reminders for what is showing, one line each.
+    ///
+    /// The player screen gives this pane 33 cells, which leaves 29 inside the border and the
+    /// padding, so every line here is written to fit that: a reminder that runs off the edge is
+    /// worse than no reminder, since the key it names is the part that goes. The number of lines
+    /// varies with the mode, and the listing gives up a row for them.
+    fn hint_lines(&self) -> &'static [&'static str] {
+        if self.searching {
+            return &["enter keep · esc cancel", "tab still changes pane"];
+        }
+
+        if self.typing_query.is_some() {
+            return &["enter search · esc cancel", "tab still changes pane"];
+        }
+
+        match self.mode {
+            Mode::Folder => &[
+                "a queue · A all · P playlist",
+                "enter open · bksp up · / find",
+                "x hold · M move · m mode",
+            ],
+            Mode::Playlist { .. } => &[
+                "a queue · A all · P playlist",
+                "/ find · bksp back · m mode",
+            ],
+            Mode::Browse { .. } => &[
+                "a queue · A all · P playlist",
+                "enter open · t by · bksp back",
+                "/ find · m mode",
+            ],
+            Mode::Youtube => &[
+                "enter play · a queue · A all",
+                "P playlist · d download",
+                "/ search · m mode",
+            ],
+        }
+    }
+
     /// Draw the pane in `area`. `focused` brightens the border and the selection.
     pub fn render(&mut self, frame: &mut Frame<'_>, area: Rect, focused: bool) {
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
-            .title(Line::from(" Files ").centered().style(self.theme.title()))
+            .title(Line::from(self.title()).centered().style(self.theme.title()))
             .border_style(self.theme.border(focused))
             .padding(Padding::horizontal(1));
 
@@ -607,7 +1191,8 @@ impl FilePane {
         // the keys. The message gets a row of its own rather than taking one of theirs: a reminder
         // that disappears the moment you use the pane is no reminder at all. The row is kept even
         // when there is no message, so the listing does not jump about as messages come and go.
-        let keys_rows = if self.hints { 2 } else { 0 };
+        let keys = self.hint_lines();
+        let keys_rows = if self.hints && focused { keys.len() as u16 } else { 0 };
 
         let [path_area, list_area, status_area, keys_area] = Layout::vertical([
             Constraint::Length(1),
@@ -619,15 +1204,47 @@ impl FilePane {
 
         let width = inner.width as usize;
 
-        let header = match &self.source {
-            Source::Playlist { name, detail } => Line::from(vec![
+        let header = match &self.mode {
+            Mode::Playlist { name, detail } => Line::from(vec![
                 Span::from("♪ ").style(self.theme.accent()),
                 Span::from(truncate(name, width.saturating_sub(detail.chars().count() + 3)))
                     .style(self.theme.accent().add_modifier(Modifier::BOLD)),
                 Span::from(format!(" {detail}")).style(self.theme.muted()),
             ]),
-            Source::Folder => Line::from(truncate_left(&name_of(&self.cwd), width))
+            Mode::Folder => Line::from(truncate_left(&name_of(&self.cwd), width))
                 .style(self.theme.accent()),
+            Mode::Browse { facet, group } => {
+                let what = match group {
+                    Some(value) => format!("{} · {value}", facet.label()),
+                    None => format!("{} · {}", facet.label(), name_of(&self.cwd)),
+                };
+
+                Line::from(vec![
+                    Span::from("☰ ").style(self.theme.accent()),
+                    Span::from(truncate(&what, width.saturating_sub(2)))
+                        .style(self.theme.accent().add_modifier(Modifier::BOLD)),
+                ])
+            }
+            Mode::Youtube => {
+                let what = match &self.typing_query {
+                    Some(typed) => typed.clone(),
+                    None if self.query.is_empty() => "press / to search".to_string(),
+                    None => self.query.clone(),
+                };
+
+                let mut spans = vec![
+                    Span::from("▷ ").style(self.theme.accent()),
+                    Span::from(truncate(&what, width.saturating_sub(3)))
+                        .style(self.theme.accent().add_modifier(Modifier::BOLD)),
+                ];
+
+                // A block for the cursor, so a query being typed looks like one.
+                if self.typing_query.is_some() {
+                    spans.push(Span::from("█").style(self.theme.accent()));
+                }
+
+                Line::from(spans)
+            }
         };
 
         frame.render_widget(header, path_area);
@@ -640,7 +1257,7 @@ impl FilePane {
                 let held = match entry {
                     Entry::File(song) => self.held.iter().any(|path| path == song.path()),
                     Entry::Folder(path) => self.held.contains(path),
-                    Entry::Parent(_) => false,
+                    Entry::Parent(_) | Entry::Group { .. } => false,
                 };
 
                 let line = match entry {
@@ -655,6 +1272,21 @@ impl FilePane {
                         Span::from(truncate(&name_of(path), width.saturating_sub(4)))
                             .style(self.theme.text()),
                     ]),
+                    // How many tracks are in it is the useful part, so it goes on the row rather
+                    // than being something to open the group to find out.
+                    Entry::Group { value, songs } => {
+                        let count = songs.len().to_string();
+
+                        Line::from(vec![
+                            Span::from("▸ ").style(self.theme.muted()),
+                            Span::from(truncate(
+                                value,
+                                width.saturating_sub(count.chars().count() + 5),
+                            ))
+                            .style(self.theme.text()),
+                            Span::from(format!("  {count}")).style(self.theme.muted()),
+                        ])
+                    }
                     // Music is named by what it is, not by what the file is called: artist and
                     // title where the tags provide them, and the file name only for a track that has
                     // neither, where the name is all there is to go on.
@@ -732,27 +1364,24 @@ impl FilePane {
         // fonts, where they show as empty boxes. `P` sends the highlighted row to the selected
         // playlist — the player screen acts on it, but this is the pane it is pressed in, so this is
         // where it has to be named.
-        let keys: [Line<'_>; 2] = if self.searching {
-            [
-                Line::from("enter keep · esc cancel").style(self.theme.muted()),
-                Line::from("tab still changes pane").style(self.theme.muted()),
-            ]
-        } else {
-            match self.source {
-                Source::Playlist { .. } => [
-                    Line::from("a queue · A all · P playlist").style(self.theme.muted()),
-                    Line::from("/ find · bksp back").style(self.theme.muted()),
-                ],
-                Source::Folder => [
-                    Line::from("a queue · A all · P playlist").style(self.theme.muted()),
-                    Line::from("enter open · bksp up · / find · x hold · M move")
-                        .style(self.theme.muted()),
-                ],
-            }
-        };
+        let lines: Vec<Line<'_>> = keys
+            .iter()
+            .map(|keys| Line::from(*keys).style(self.theme.muted()))
+            .collect();
 
-        frame.render_widget(ratatui::widgets::Paragraph::new(keys.to_vec()), keys_area);
+        frame.render_widget(ratatui::widgets::Paragraph::new(lines), keys_area);
     }
+}
+
+/// Where downloads go when the application has not said otherwise.
+///
+/// The platform's music folder, under the player's own name, so a download is never mixed into a
+/// library the user arranged by hand.
+fn default_download_folder() -> PathBuf {
+    dirs::audio_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("ogma")
 }
 
 /// Move `source` into `folder`, keeping its name.

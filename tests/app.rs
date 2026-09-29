@@ -160,29 +160,27 @@ fn where_the_application_starts_and_how_it_comes_back() {
         "and came back where it was, rather than at the library root"
     );
 
-    // --- the YouTube screen is a menu entry away, and comes straight back ---
-    press(&mut app, KeyCode::Esc);
-    press(&mut app, KeyCode::Down);
-    press(&mut app, KeyCode::Down);
-    press(&mut app, KeyCode::Enter);
-    assert_eq!(app.screen(), ScreenKind::Youtube);
+    // --- the file pane's other modes are a key away, and come back to the files ---
+    // `m` cycles files → browse → youtube → files, without leaving the player.
+    press(&mut app, KeyCode::Char('m'));
+    assert_eq!(app.screen(), ScreenKind::Play, "the modes are a pane, not a screen");
+    assert!(frame_of(&mut app).contains("artist"), "browse groups by artist first");
 
-    // It opens ready to be typed into, and escape with nothing found is the way out.
-    press(&mut app, KeyCode::Esc);
-    assert_eq!(app.screen(), ScreenKind::Start);
+    press(&mut app, KeyCode::Char('m'));
+    let frame = frame_of(&mut app);
+    assert!(frame.contains("YouTube"), "and then the search: {frame}");
+    assert!(frame.contains("press / to search"), "which waits to be asked: {frame}");
 
-    // Continue is waiting where it was, the detour having changed nothing.
-    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('m'));
     assert_eq!(app.screen(), ScreenKind::Play);
-    assert_eq!(app.browsing_path(), Some(inside.as_path()));
+    assert_eq!(app.browsing_path(), Some(inside.as_path()), "back to the folder it was in");
 
     // --- a setting changed in the config reaches the player that was set aside ---
     assert!(frame_of(&mut app).contains("+/-"), "the keys start out listed");
 
-    // To the menu, down to Open Config, and in. Continue, Select Folder and Search YouTube sit
-    // above it.
+    // To the menu, down to Open Config, and in.
     press(&mut app, KeyCode::Esc);
-    for _ in 0..3 {
+    for _ in 0..2 {
         press(&mut app, KeyCode::Down);
     }
     press(&mut app, KeyCode::Enter);
@@ -207,7 +205,7 @@ fn where_the_application_starts_and_how_it_comes_back() {
 
     // And back on again, without reopening the library.
     press(&mut app, KeyCode::Esc);
-    for _ in 0..3 {
+    for _ in 0..2 {
         press(&mut app, KeyCode::Down);
     }
     press(&mut app, KeyCode::Enter);

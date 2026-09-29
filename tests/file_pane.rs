@@ -726,3 +726,395 @@ fn putting_a_file_down_where_it_already_is_changes_nothing() {
     assert!(root.join("a-first.mp3").is_file());
     assert!(render(&mut pane, true).contains("already here"));
 }
+
+// ------------------------------------------------------------------- the pane's other modes
+
+/// A stand-in for yt-dlp, so the search and the download can be driven without a network.
+///
+/// It answers `--version` like the real thing, prints two results for a search, and for a download
+/// writes a file into the folder it was given and prints where it went — which is the whole of the
+/// conversation this pane has with it.
+///
+/// Written and pointed at once for the whole test binary: the tests here run alongside each other,
+/// and setting an environment variable while another thread is starting a process is exactly the
+/// race that leaves one of them talking to the real yt-dlp.
+fn fake_yt_dlp() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+
+    INSTALLED.call_once(|| {
+        let root = common::scratch_dir("pane-fake-ytdlp");
+        let script = root.join("fake-yt-dlp");
+
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        --version) echo "2026.01.01"; exit 0 ;;
+    esac
+done
+
+case "$*" in
+    *--dump-json*)
+        echo '{"id":"aaaaaaaaaaa","url":"https://www.youtube.com/watch?v=aaaaaaaaaaa","title":"First Song","channel":"A Channel","duration":131}'
+        echo '{"id":"bbbbbbbbbbb","url":"https://www.youtube.com/watch?v=bbbbbbbbbbb","title":"Second Song","channel":"Another Channel","duration":245}'
+        exit 0
+        ;;
+esac
+
+# A download: the folder it was handed follows --paths.
+folder=""
+want=""
+for arg in "$@"; do
+    if [ "$want" = "yes" ]; then folder="$arg"; want=""; fi
+    if [ "$arg" = "--paths" ]; then want="yes"; fi
+done
+
+echo "[ogma]  50.0%"
+echo "[ogma] 100.0%"
+printf 'fetched' > "$folder/A Channel - First Song.opus"
+echo "$folder/A Channel - First Song.opus"
+"#,
+        )
+        .expect("write fake yt-dlp");
+
+        let mut permissions = std::fs::metadata(&script).expect("stat").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        std::fs::set_permissions(&script, permissions).expect("chmod");
+
+        // SAFETY: written once, before any test here starts a process, and never changed after.
+        unsafe {
+            std::env::set_var("OGMA_YTDLP", &script);
+        }
+    });
+}
+
+/// Poll the pane until `done` says the background work has landed, or give up.
+fn wait_for(pane: &mut FilePane, done: impl Fn(&mut FilePane) -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+    while std::time::Instant::now() < deadline {
+        pane.poll();
+
+        if done(pane) {
+            return;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    panic!("the background work never finished");
+}
+
+/// A tagged library, so browsing by artist has something to group.
+fn tagged_tree(name: &str) -> PathBuf {
+    let root = common::scratch_dir(name);
+
+    common::write_wav(
+        &root,
+        &common::WavSpec {
+            name: "01.wav",
+            title: Some("Xtal"),
+            artist: Some("Aphex Twin"),
+            album: Some("Selected Ambient Works"),
+            ..common::WavSpec::default()
+        },
+    );
+    common::write_wav(
+        &root,
+        &common::WavSpec {
+            name: "02.wav",
+            title: Some("Nocturne"),
+            artist: Some("Chopin"),
+            album: Some("Nocturnes"),
+            ..common::WavSpec::default()
+        },
+    );
+
+    root.canonicalize().expect("canonical root")
+}
+
+#[test]
+fn m_cycles_the_pane_through_its_modes() {
+    let root = tagged_tree("pane-modes");
+    fake_yt_dlp();
+
+    let mut pane = FilePane::at(&root);
+    let mut player = Player::new();
+
+    assert_eq!(pane.mode_name(), "files", "it opens on the folder");
+
+    press(&mut pane, &mut player, KeyCode::Char('m'));
+    assert_eq!(pane.mode_name(), "browse");
+
+    press(&mut pane, &mut player, KeyCode::Char('m'));
+    assert_eq!(pane.mode_name(), "youtube");
+
+    // Arriving does not put the keyboard in a text field: `/` is what asks for one.
+    assert!(!pane.is_typing(), "the keys are still the pane's");
+    press(&mut pane, &mut player, KeyCode::Char('/'));
+    assert!(pane.is_typing());
+    press(&mut pane, &mut player, KeyCode::Esc);
+
+    press(&mut pane, &mut player, KeyCode::Char('m'));
+    assert_eq!(pane.mode_name(), "files", "and round again");
+    assert_eq!(pane.cwd(), root, "in the folder it started in");
+}
+
+#[test]
+fn browse_groups_the_folder_by_artist() {
+    let root = tagged_tree("pane-browse");
+    let mut pane = FilePane::at(&root);
+    let mut player = Player::new();
+
+    press(&mut pane, &mut player, KeyCode::Char('m'));
+    wait_for(&mut pane, |pane| render(pane, true).contains("Aphex"));
+
+    let frame = render(&mut pane, true);
+    assert!(frame.contains("artist"), "the header says what it is grouping by: {frame}");
+    assert!(frame.contains("Aphex Twin"), "{frame}");
+    assert!(frame.contains("Chopin"), "{frame}");
+    assert!(!frame.contains("01.wav"), "rows are names, not files: {frame}");
+}
+
+#[test]
+fn t_changes_what_the_browse_files_tracks_under() {
+    let root = tagged_tree("pane-facet");
+    let mut pane = FilePane::at(&root);
+    let mut player = Player::new();
+
+    press(&mut pane, &mut player, KeyCode::Char('m'));
+    wait_for(&mut pane, |pane| render(pane, true).contains("Aphex"));
+
+    press(&mut pane, &mut player, KeyCode::Char('t'));
+
+    let frame = render(&mut pane, true);
+    assert!(frame.contains("album"), "{frame}");
+    assert!(frame.contains("Selected Ambient"), "grouped by album now: {frame}");
+}
+
+#[test]
+fn a_group_opens_into_its_tracks_and_backspace_comes_out() {
+    let root = tagged_tree("pane-group-open");
+    let mut pane = FilePane::at(&root);
+    let mut player = Player::new();
+
+    press(&mut pane, &mut player, KeyCode::Char('m'));
+    wait_for(&mut pane, |pane| render(pane, true).contains("Aphex"));
+
+    press(&mut pane, &mut player, KeyCode::Enter);
+
+    let frame = render(&mut pane, true);
+    assert!(frame.contains("Xtal"), "the artist's tracks: {frame}");
+    assert!(!frame.contains("Chopin"), "and only theirs: {frame}");
+
+    press(&mut pane, &mut player, KeyCode::Backspace);
+    assert!(render(&mut pane, true).contains("Chopin"), "back to the groups");
+}
+
+#[test]
+fn a_queues_a_whole_group() {
+    let root = tagged_tree("pane-group-queue");
+    let mut pane = FilePane::at(&root);
+    let mut player = Player::new();
+
+    press(&mut pane, &mut player, KeyCode::Char('m'));
+    wait_for(&mut pane, |pane| render(pane, true).contains("Aphex"));
+
+    press(&mut pane, &mut player, KeyCode::Char('a'));
+
+    assert_eq!(player.queue().len(), 1, "the one track that artist has here");
+    assert_eq!(player.queue()[0].title(), Some("Xtal"));
+    // What `P` sends to a playlist is the same thing.
+    assert_eq!(pane.highlighted_songs().len(), 1);
+}
+
+#[test]
+fn a_search_fills_the_listing_with_tracks_that_stream() {
+    let root = tagged_tree("pane-search");
+    fake_yt_dlp();
+
+    let mut pane = FilePane::at(&root);
+    let mut player = Player::new();
+
+    press(&mut pane, &mut player, KeyCode::Char('m'));
+    press(&mut pane, &mut player, KeyCode::Char('m'));
+    assert_eq!(pane.mode_name(), "youtube");
+
+    press(&mut pane, &mut player, KeyCode::Char('/'));
+    for c in "aphex".chars() {
+        press(&mut pane, &mut player, KeyCode::Char(c));
+    }
+    press(&mut pane, &mut player, KeyCode::Enter);
+
+    wait_for(&mut pane, |pane| !pane.results().is_empty());
+
+    assert_eq!(pane.results().len(), 2);
+    assert!(pane.results()[0].is_stream());
+
+    let frame = render(&mut pane, true);
+    assert!(frame.contains("First Song"), "{frame}");
+    assert!(frame.contains("2 results"), "{frame}");
+}
+
+#[test]
+fn a_result_plays_queues_and_goes_to_a_playlist_like_any_other_row() {
+    let root = tagged_tree("pane-search-use");
+    fake_yt_dlp();
+
+    let mut pane = FilePane::at(&root);
+    let mut player = Player::new();
+
+    press(&mut pane, &mut player, KeyCode::Char('m'));
+    press(&mut pane, &mut player, KeyCode::Char('m'));
+    press(&mut pane, &mut player, KeyCode::Char('/'));
+    for c in "song".chars() {
+        press(&mut pane, &mut player, KeyCode::Char(c));
+    }
+    press(&mut pane, &mut player, KeyCode::Enter);
+    wait_for(&mut pane, |pane| !pane.results().is_empty());
+
+    // Enter streams what is highlighted.
+    press(&mut pane, &mut player, KeyCode::Enter);
+    let playing = player.current().expect("something is playing");
+    assert!(playing.is_stream());
+    assert_eq!(playing.title(), Some("First Song"));
+
+    // `a` queues it, and what `P` would send to a playlist knows what it is.
+    press(&mut pane, &mut player, KeyCode::Down);
+    press(&mut pane, &mut player, KeyCode::Char('a'));
+    assert_eq!(player.queue().len(), 1);
+    assert_eq!(player.queue()[0].title(), Some("Second Song"));
+
+    let chosen = pane.highlighted_songs();
+    assert_eq!(chosen.len(), 1);
+    assert!(chosen[0].is_stream());
+    assert_eq!(chosen[0].title(), Some("Second Song"));
+}
+
+#[test]
+fn a_stream_cannot_be_picked_up_to_move() {
+    let root = tagged_tree("pane-search-move");
+    fake_yt_dlp();
+
+    let mut pane = FilePane::at(&root);
+    let mut player = Player::new();
+
+    press(&mut pane, &mut player, KeyCode::Char('m'));
+    press(&mut pane, &mut player, KeyCode::Char('m'));
+    press(&mut pane, &mut player, KeyCode::Char('/'));
+    for c in "song".chars() {
+        press(&mut pane, &mut player, KeyCode::Char(c));
+    }
+    press(&mut pane, &mut player, KeyCode::Enter);
+    wait_for(&mut pane, |pane| !pane.results().is_empty());
+
+    press(&mut pane, &mut player, KeyCode::Char('x'));
+
+    assert!(pane.held().is_empty());
+    assert!(render(&mut pane, true).contains("not a file"));
+}
+
+#[test]
+fn d_downloads_the_highlighted_result() {
+    let root = tagged_tree("pane-download");
+    fake_yt_dlp();
+
+    let into = root.join("downloads");
+    let mut pane = FilePane::at(&root);
+    pane.set_download_folder(into.clone());
+
+    let mut player = Player::new();
+
+    press(&mut pane, &mut player, KeyCode::Char('m'));
+    press(&mut pane, &mut player, KeyCode::Char('m'));
+    press(&mut pane, &mut player, KeyCode::Char('/'));
+    for c in "song".chars() {
+        press(&mut pane, &mut player, KeyCode::Char(c));
+    }
+    press(&mut pane, &mut player, KeyCode::Enter);
+    wait_for(&mut pane, |pane| !pane.results().is_empty());
+
+    press(&mut pane, &mut player, KeyCode::Char('d'));
+    wait_for(&mut pane, |pane| render(pane, true).contains("saved"));
+
+    assert!(into.join("A Channel - First Song.opus").is_file(), "the file is where it was asked for");
+}
+
+#[test]
+fn the_title_says_which_mode_is_showing() {
+    let root = tagged_tree("pane-title");
+    fake_yt_dlp();
+
+    let mut pane = FilePane::at(&root);
+    let mut player = Player::new();
+
+    assert!(render(&mut pane, true).contains("Files"));
+
+    press(&mut pane, &mut player, KeyCode::Char('m'));
+    assert!(render(&mut pane, true).contains("Browse"));
+
+    press(&mut pane, &mut player, KeyCode::Char('m'));
+    assert!(render(&mut pane, true).contains("YouTube"));
+
+    press(&mut pane, &mut player, KeyCode::Esc);
+    press(&mut pane, &mut player, KeyCode::Char('m'));
+
+    let frame = render(&mut pane, true);
+    assert!(frame.contains("Files"), "back round to the folder: {frame}");
+    assert!(!frame.contains("YouTube"), "and nothing of the last mode is left: {frame}");
+}
+
+#[test]
+fn a_playlist_is_titled_as_one() {
+    let root = tagged_tree("pane-title-playlist");
+    let mut pane = FilePane::at(&root);
+
+    pane.show_playlist(&ogma::playlist::Playlist::new("Late Night"));
+
+    let frame = render(&mut pane, true);
+    assert!(frame.contains("Playlist"), "{frame}");
+    assert!(frame.contains("Late Night"), "and which one, under the border: {frame}");
+}
+
+#[test]
+fn every_mode_lists_its_own_keys_in_full() {
+    let root = tagged_tree("pane-hints");
+    fake_yt_dlp();
+
+    let mut pane = FilePane::at(&root);
+    let mut player = Player::new();
+
+    // At the width the player screen gives the pane. A key reminder that runs off the edge loses
+    // the key, which is the part worth reading, so each one is checked whole.
+    let shown = |pane: &mut FilePane| render_at(pane, true, 33);
+
+    let files = shown(&mut pane);
+    for keys in ["a queue", "A all", "P playlist", "enter open", "bksp up", "/ find", "x hold", "M move", "m mode"] {
+        assert!(files.contains(keys), "the files mode does not show {keys}:\n{files}");
+    }
+
+    press(&mut pane, &mut player, KeyCode::Char('m'));
+    let browse = shown(&mut pane);
+    for keys in ["a queue", "A all", "P playlist", "enter open", "t by", "bksp back", "/ find", "m mode"] {
+        assert!(browse.contains(keys), "the browse mode does not show {keys}:\n{browse}");
+    }
+
+    press(&mut pane, &mut player, KeyCode::Char('m'));
+    let youtube = shown(&mut pane);
+    for keys in ["enter play", "a queue", "A all", "P playlist", "d download", "/ search", "m mode"] {
+        assert!(youtube.contains(keys), "the youtube mode does not show {keys}:\n{youtube}");
+    }
+
+    press(&mut pane, &mut player, KeyCode::Char('/'));
+    let typing = shown(&mut pane);
+    assert!(typing.contains("enter search"), "{typing}");
+    assert!(typing.contains("esc cancel"), "{typing}");
+    press(&mut pane, &mut player, KeyCode::Esc);
+
+    pane.show_playlist(&ogma::playlist::Playlist::new("Late Night"));
+    let playlist = shown(&mut pane);
+    for keys in ["a queue", "A all", "P playlist", "bksp back", "/ find", "m mode"] {
+        assert!(playlist.contains(keys), "the playlist mode does not show {keys}:\n{playlist}");
+    }
+}

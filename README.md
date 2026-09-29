@@ -103,8 +103,7 @@ Nothing is queued on open. The queue is yours to fill from the file listing.
 | enter, space | Choose |
 | `q`, esc | Quit |
 
-**Continue** only appears once there is a player screen to go back to. **Search YouTube** opens the
-search screen below.
+**Continue** only appears once there is a player screen to go back to.
 
 #### Folder browser
 
@@ -118,7 +117,7 @@ into a folder before selecting it — the title says which one `s` would take.
 | `s`, space | Use the listed folder as the library |
 | `~` | Jump to your home folder |
 | `.` | Show or hide dotfolders |
-| `/` | Find in the listing; esc clears it |
+| `/` | Find in the listing; in youtube mode, start a query. Esc clears it |
 | `j` `k` `g` `G`, page up / down | Move |
 | `q`, esc | Back to the menu, changing nothing |
 
@@ -151,19 +150,43 @@ Playback:
 | `tab` / `shift-tab`, `l` / `h` | Next / previous pane |
 | `q`, esc | Back to the menu (playback carries on) |
 
-Files pane:
+Multimodal panel. One pane with four things it can list, `m` cycling between the first three. The
+border is titled for whichever is showing — Files, Browse, YouTube, Playlist — and the line under it
+says what within that mode: the folder, the grouping, the query, the playlist.
+
+| Mode | Lists |
+| --- | --- |
+| **files** | The folder on disk, where the panel opens |
+| **browse** | Everything below that folder grouped under one tag — artist, album, genre or year |
+| **youtube** | What a search turned up, to stream or to download |
+| **playlist** | A playlist's own order, opened with `o` from the playlists pane |
+
+The rows are the same kind of thing in every mode, which is the point of the panel: `a` queues, `A`
+queues the lot, `P` sends to the selected playlist, and enter plays — whether the row came off the
+disk or out of a search.
 
 | Key | Does |
 | --- | --- |
-| enter | Open a folder |
-| backspace | Up a folder |
-| `a` | Queue the highlighted file |
-| `A` | Queue everything in the folder, recursively |
-| `P` | Add the highlighted file to the selected playlist |
+| `m` | Next mode: files → browse → youtube |
+| enter | Open a folder or a group; play a track or stream a result |
+| backspace | Out a step: up a folder, out of a group, back to the files |
+| `a` | Queue the highlighted row — a track, a whole folder, or a whole group |
+| `A` | Queue everything listed |
+| `P` | Add the highlighted row to the selected playlist |
 | `x` | Pick the highlighted file or folder up to move it; again puts it back down |
 | `M` | Move everything held into the folder being listed |
 | `/` | Find in the listing; esc clears it |
 | `j` `k` `g` `G`, page up / down | Move |
+
+In browse mode, `t` changes what the tracks are filed under. The groups are listed by name with the
+count beside them, and the tracks that say nothing land in an `Unknown Artist` group at the bottom
+rather than being left out. Reading a folder's tags is the slow part, so it happens on its own
+thread — the pane says `reading tags…` meanwhile — and the result is kept until you walk somewhere
+else.
+
+In youtube mode, `/` starts a query and enter runs it; `d` downloads the highlighted result instead
+of streaming it. Arriving in the mode does not put the keyboard in a text field — the keys stay the
+panel's until `/` asks for one. See [YouTube](#youtube) below.
 
 Moving files: `x` marks a row — the margin shows `✂` — then walk wherever you like and press `M` to
 move everything held into the folder on screen. Folders move whole, several things can be held at
@@ -185,7 +208,7 @@ loads and one written now still opens in anything that only knows about files.
 | Key | Does |
 | --- | --- |
 | enter | Load the playlist into the queue, replacing it |
-| `o` | Open it in the files pane to look through |
+| `o` | Open it in the multimodal panel to look through |
 | `c` | New playlist |
 | `s` / `r` | Cycle the sort / reverse it |
 | `d` | Delete (asks first) |
@@ -217,29 +240,27 @@ Only a song **ending by itself** is affected. `n` and `p` always move on and bac
 are for. The one exception is the end of the queue with queue repeat on, where `n` wraps round to the
 start rather than stopping, since there is always a next song.
 
-#### YouTube:
+#### YouTube
 
-Type a query, press enter, and pick from what comes back. A result can be **streamed** — played
-straight from the network, with nothing written to disk — or **downloaded** into the download
-folder, where it is an ordinary file the library scan picks up.
+The **youtube** mode of the multimodal panel, which `m` reaches. Needs `yt-dlp`; without it the mode says
+so and the rest of the player is unaffected.
 
-| Key | Does |
-| --- | --- |
-| `/`, `s` | Type a new query |
-| enter | Stream the highlighted result now |
-| `a` | Queue the chosen results, to stream when they come round |
-| `d` | Download the chosen results |
-| space | Mark a result |
-| `m` | Mark everything, or clear the marks |
-| `j` `k` `g` `G`, page up / down | Move |
-| `q`, esc | Back to the menu |
+`/` starts a query, enter runs it, and what comes back lists like any other track. Until then the
+keys are the panel's own, so entering the mode by accident costs one `m` to leave rather than a
+screenful of typing. A result can be
+**streamed** — played straight from the network, with nothing written to disk — or **downloaded**
+with `d` into the download folder, where it is an ordinary file the library scan picks up.
 
-"Chosen" means the marked results, or the highlighted one when nothing is marked.
+Because the results are ordinary rows, the keys are the pane's own: enter streams the highlighted
+result now, `a` queues it, `A` queues the page, and `P` sends it to the selected playlist.
 
 Streamed tracks sit in the queue beside local files and play the same way, with two differences:
-they cannot be seeked (the audio arrives as it plays), and they are listed by what the search said
-rather than by tags, since there is no file to read any. Searching and downloading both run on their
-own threads, so the screen stays usable while they work.
+they cannot be seeked (the audio arrives as it plays), and they are named by what the search said
+rather than by tags, since there is no file to read any. That name follows them into the queue, into
+a playlist and back out again.
+
+Searching and downloading both run on their own threads, so the pane stays usable while they work,
+and the line under the listing says how far a download has got.
 
 Downloads are named `Artist - Title`, with tags and cover art embedded where the format and the
 installed helpers allow; a cover that cannot be embedded costs the track its picture, not the
@@ -262,7 +283,7 @@ What this fetches is between you and the rights holder — yt-dlp is the same to
 | On close | What becomes of the daemon when the **last** interface closes: keep it if it was started by hand (default), always kill it, or always keep it. Closing one of several interfaces never stops playback — see [Several interfaces at once](#several-interfaces-at-once) |
 | Downloads | Where YouTube downloads are written. `enter` types a path, `d` goes back to the default: `Downloads` beside the library, or the platform's music folder under `ogma` when no library is set |
 | Download as | What a downloaded track is kept as: as served (default, no re-encoding), opus, mp3, m4a or flac. Converting needs `ffmpeg` |
-| Search results | How many hits a YouTube search asks for. Left / right adjust, 5 at a time |
+| Search results | How many hits the panel's YouTube mode asks for. Left / right adjust, 5 at a time |
 | Theme | Colours from `theme.toml` instead of the terminal's palette. Restart to apply |
 
 `s` saves. `q` or esc leaves; unsaved edits are still live for the session, but only the file survives

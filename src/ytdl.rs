@@ -134,6 +134,27 @@ impl Track {
         }
     }
 
+    /// The result a streamed song came from, or `None` for a song that is a file.
+    ///
+    /// What the search knew is carried on the song itself, so a row picked out of a listing can be
+    /// downloaded without asking YouTube what it was again.
+    pub fn of(song: &Song) -> Option<Self> {
+        let info = song.stream_info()?;
+        let url = song.uri();
+
+        // The id is the tail of a watch URL. Nothing here needs it to be right — the URL is what
+        // yt-dlp is handed — so a link of another shape keeps the whole of itself as its id.
+        let id = url.rsplit_once("v=").map(|(_, id)| id.to_string()).unwrap_or_else(|| url.clone());
+
+        Some(Track {
+            title: info.title.clone().unwrap_or_else(|| url.clone()),
+            uploader: info.artist.clone(),
+            duration: info.duration,
+            id,
+            url,
+        })
+    }
+
     /// The track as something the player can be handed, playing from the network rather than a file.
     pub fn song(&self) -> Song {
         Song::stream(

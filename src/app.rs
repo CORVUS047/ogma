@@ -17,7 +17,7 @@ use crate::player::Player;
 use crate::theme::Theme;
 use crate::ui::{
     ConfigMenu, ConfigMenuOutcome, FolderBrowser, FolderBrowserOutcome, PlayerScreen,
-    PlayerScreenOutcome, StartMenu, StartMenuChoice, YoutubeOutcome, YoutubeScreen,
+    PlayerScreenOutcome, StartMenu, StartMenuChoice,
 };
 
 /// How long the loop waits for a key before catching up with the audio.
@@ -32,7 +32,6 @@ pub enum ScreenKind {
     Config,
     Browse,
     Play,
-    Youtube,
 }
 
 /// Which screen has the user's attention.
@@ -42,7 +41,6 @@ enum Screen {
     Config(ConfigMenu),
     Browse(FolderBrowser),
     Play(Box<PlayerScreen>),
-    Youtube(Box<YoutubeScreen>),
 }
 
 /// The running player.
@@ -77,7 +75,6 @@ impl Screen {
             Screen::Config(_) => ScreenKind::Config,
             Screen::Browse(_) => ScreenKind::Browse,
             Screen::Play(_) => ScreenKind::Play,
-            Screen::Youtube(_) => ScreenKind::Youtube,
         }
     }
 }
@@ -152,8 +149,11 @@ impl App {
             // Only the cells that changed are written, which a screen of ordinary text survives
             // fine — but a double-width character or an emoji occupies two cells, and a terminal
             // asked to overwrite half of one can leave the other half behind. YouTube titles are
-            // full of both, so changing screen repaints from scratch rather than by difference.
-            if self.screen.kind() != showing {
+            // full of both, so a screen or a pane that has just been listing them is repainted
+            // from scratch rather than written over.
+            let changed = self.screen.kind() != showing;
+
+            if changed || self.take_repaint() {
                 terminal.clear()?;
                 showing = self.screen.kind();
             }
@@ -210,6 +210,14 @@ impl App {
         }
     }
 
+    /// Whether a screen has asked to be drawn on a clean slate, taking the request.
+    fn take_repaint(&mut self) -> bool {
+        match &mut self.screen {
+            Screen::Play(screen) => screen.take_repaint(),
+            _ => false,
+        }
+    }
+
     /// One pass of the work the event loop does between key presses.
     ///
     /// Public so the player can be driven without a terminal, which is how the socket is tested.
@@ -223,9 +231,10 @@ impl App {
         self.remote.refresh();
         self.collect_fills();
 
-        // A search or a download runs on its own thread, and this is where what it has done comes
-        // in — without it the screen would sit on "searching…" with the answer already waiting.
-        if let Screen::Youtube(screen) = &mut self.screen {
+        // Reading a folder's tags, asking YouTube and fetching a track all run on threads of their
+        // own, and this is where what they did arrives — without it the pane would sit on
+        // "searching…" with the answer already waiting.
+        if let Screen::Play(screen) = &mut self.screen {
             screen.poll();
         }
     }
@@ -262,7 +271,6 @@ impl App {
             Screen::Config(menu) => menu.render(frame, area, &self.config),
             Screen::Browse(browser) => browser.render(frame, area),
             Screen::Play(screen) => screen.render(frame, area, self.remote.player()),
-            Screen::Youtube(screen) => screen.render(frame, area),
         }
     }
 
@@ -303,13 +311,6 @@ impl App {
                     self.suspend_player();
                 }
             }
-            Screen::Youtube(screen) => {
-                let outcome = screen.handle_key(key, &mut self.remote, &self.config);
-
-                if let Some(YoutubeOutcome::Close) = outcome {
-                    self.screen = self.start_menu();
-                }
-            }
         }
     }
 
@@ -323,15 +324,29 @@ impl App {
         let hints = self.config.show_control_hints();
         let messages = !self.config.hide_status_messages();
 
+        // Worked out here rather than in the pane: where downloads go depends on the library, and
+        // the application is what knows about that.
+        let search_results = self.config.search_results();
+        let format = self.config.download_format();
+        let folder = self.download_folder();
+
         if let Some(screen) = self.suspended.as_mut() {
             screen.set_hints(hints);
             screen.set_messages(messages);
+
+            if let Some(folder) = folder.clone() {
+                screen.set_youtube(search_results, format, folder);
+            }
         }
 
         match &mut self.screen {
             Screen::Play(screen) => {
                 screen.set_hints(hints);
                 screen.set_messages(messages);
+
+                if let Some(folder) = folder {
+                    screen.set_youtube(search_results, format, folder);
+                }
             }
             Screen::Start(menu) => menu.set_hints(hints),
             Screen::Browse(browser) => {
@@ -339,10 +354,6 @@ impl App {
                 browser.set_messages(messages);
             }
             Screen::Config(menu) => menu.set_messages(messages),
-            Screen::Youtube(screen) => {
-                screen.set_hints(hints);
-                screen.set_messages(messages);
-            }
         }
     }
 
@@ -388,6 +399,7 @@ impl App {
         screen.set_hints(self.config.show_control_hints());
         screen.set_theme(self.theme);
         screen.set_messages(!self.config.hide_status_messages());
+        self.dress_youtube(&mut screen);
 
         // A newly opened library is the player now; there is nothing older to go back to.
         self.suspended = None;
@@ -405,21 +417,15 @@ impl App {
         Screen::Start(menu)
     }
 
-    /// The YouTube search screen, dressed as the config asks.
-    ///
-    /// Downloads go where the config says, or beside the library when it says nothing: a folder the
-    /// library already covers is the one place a download is certain to be found again.
-    fn youtube_screen(&self) -> Screen {
-        let mut screen = YoutubeScreen::new();
-        screen.set_hints(self.config.show_control_hints());
-        screen.set_theme(self.theme);
-        screen.set_messages(!self.config.hide_status_messages());
-
+    /// Tell a player screen what its YouTube mode should work from.
+    fn dress_youtube(&self, screen: &mut PlayerScreen) {
         if let Some(folder) = self.download_folder() {
-            screen.download_into(folder);
+            screen.set_youtube(
+                self.config.search_results(),
+                self.config.download_format(),
+                folder,
+            );
         }
-
-        Screen::Youtube(Box::new(screen))
     }
 
     /// Where downloads are written, when something other than the platform default is wanted.
@@ -448,7 +454,6 @@ impl App {
 
                 self.screen = Screen::Browse(browser);
             }
-            StartMenuChoice::SearchYoutube => self.screen = self.youtube_screen(),
             StartMenuChoice::OpenConfig => {
                 let mut menu = ConfigMenu::new();
                 menu.set_theme(self.theme);

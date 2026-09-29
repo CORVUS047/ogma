@@ -52,7 +52,7 @@ pub struct PlayerScreen {
     /// Selection within the upcoming queue.
     queue_state: ListState,
     artwork: ArtworkView,
-    /// The file listing in the left column, for filling the queue.
+    /// The multimodal panel in the left column, for filling the queue.
     files: FilePane,
     /// The playlists above it.
     playlists: PlaylistPane,
@@ -107,6 +107,28 @@ impl PlayerScreen {
     pub fn set_messages(&mut self, messages: bool) {
         self.files.set_messages(messages);
         self.playlists.set_messages(messages);
+    }
+
+    /// Take in whatever the multimodal panel's background work has finished with.
+    pub fn poll(&mut self) {
+        self.files.poll();
+    }
+
+    /// Whether the screen should be cleared before it is drawn again, taking the flag.
+    pub fn take_repaint(&mut self) -> bool {
+        self.files.take_repaint()
+    }
+
+    /// Pass the settings the panel's YouTube mode works from.
+    pub fn set_youtube(
+        &mut self,
+        search_results: usize,
+        format: crate::ytdl::Format,
+        folder: std::path::PathBuf,
+    ) {
+        self.files.set_search_results(search_results);
+        self.files.set_download_format(format);
+        self.files.set_download_folder(folder);
     }
 
     /// Show or hide the key reminders, here and in both side panes.
