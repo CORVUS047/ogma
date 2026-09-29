@@ -28,6 +28,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
+/// What version of this protocol the build speaks.
+///
+/// Bumped whenever a command or a reply changes shape in a way the other side could misread —
+/// a field removed from the status, an argument that means something new. An interface and a
+/// daemon from different builds can otherwise sit there misunderstanding each other quietly, which
+/// is worse than refusing to talk: the interface asks the daemon what it speaks before it trusts
+/// anything else it says. See [`Command::Version`].
+pub const PROTOCOL_VERSION: u32 = 1;
+
 /// Name of the socket inside the runtime directory.
 const SOCKET_NAME: &str = "ogma.sock";
 
@@ -194,6 +203,8 @@ pub enum Command {
     Leave { id: String, on_leave: OnLeave },
     /// How many interfaces are attached.
     Interfaces,
+    /// What version of this protocol the daemon speaks.
+    Version,
 }
 
 /// What a leaving interface would like done with the daemon.
@@ -353,6 +364,7 @@ impl Command {
                 Ok(Command::Leave { id, on_leave: OnLeave::parse(&rest)? })
             }
             "interfaces" => Ok(Command::Interfaces),
+            "version" | "protocol" => Ok(Command::Version),
             "" => Err("no command".to_string()),
             other => Err(format!("unknown command {other:?}")),
         }
@@ -403,6 +415,7 @@ impl Command {
             }
             Command::Leave { id, on_leave } => format!("leave {id} {}", on_leave.word()),
             Command::Interfaces => "interfaces".to_string(),
+            Command::Version => "version".to_string(),
         }
     }
 
@@ -427,6 +440,7 @@ impl Command {
             ("clear", "stop and forget the queue and history"),
             ("status", "report what is playing, as JSON"),
             ("interfaces", "how many interfaces are attached"),
+            ("version", "what version of the socket protocol the daemon speaks"),
             ("quit/close", "kill the daemon, whoever is attached"),
         ]
     }
@@ -487,6 +501,31 @@ impl Request {
     pub fn answer(self, reply: impl Into<String>) {
         let _ = self.reply.send(reply.into());
     }
+}
+
+/// What a daemon says when asked its protocol version.
+pub fn version_reply() -> String {
+    format!("ok: ipc {PROTOCOL_VERSION}")
+}
+
+/// Read a version out of what [`version_reply`] wrote.
+///
+/// `None` for anything else, which includes the refusal a daemon too old to know the command
+/// gives: not knowing how to say which version it speaks is itself an answer.
+pub fn parse_version(reply: &str) -> Option<u32> {
+    reply.trim().strip_prefix("ok: ipc")?.trim().parse().ok()
+}
+
+/// Ask the daemon listening on the usual socket what it speaks.
+///
+/// `Err` means nobody answered; `Ok(None)` means something answered but not with a version.
+pub fn protocol_version() -> Result<Option<u32>, String> {
+    protocol_version_of(&socket_path())
+}
+
+/// [`protocol_version`], against a daemon listening somewhere else.
+pub fn protocol_version_of(path: &Path) -> Result<Option<u32>, String> {
+    send_to(path, &Command::Version).map(|reply| parse_version(&reply))
 }
 
 /// The socket the player listens on.

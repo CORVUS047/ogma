@@ -459,6 +459,7 @@ impl Daemon {
                 }
             }
             Command::Interfaces => format!("ok: {}", count(self.interfaces.len())),
+            Command::Version => ipc::version_reply(),
         }
     }
 
@@ -578,6 +579,55 @@ fn format_time(position: Duration) -> String {
 }
 
 /// Whether a daemon is listening.
+/// What asking a running daemon which protocol it speaks came to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Handshake {
+    /// It speaks what this build speaks, so the two understand each other.
+    Agreed,
+    /// It speaks something else — or is too old to say, which amounts to the same thing.
+    ///
+    /// `theirs` is `None` for a daemon that does not know how to be asked.
+    Mismatch { ours: u32, theirs: Option<u32> },
+    /// Nobody answered, so there is nothing to disagree with yet.
+    Gone,
+}
+
+/// Ask the running daemon which protocol it speaks and compare it with this build's.
+///
+/// Worth asking before anything is believed: an interface and a daemon from different builds can
+/// otherwise misread each other's commands quietly, and a player that plays the wrong thing is
+/// harder to explain than one that refuses to start.
+pub fn handshake() -> Handshake {
+    let ours = ipc::PROTOCOL_VERSION;
+
+    match ipc::protocol_version() {
+        Ok(Some(theirs)) if theirs == ours => Handshake::Agreed,
+        Ok(theirs) => Handshake::Mismatch { ours, theirs },
+        Err(_) => Handshake::Gone,
+    }
+}
+
+/// Stop the running daemon and start one from this installation in its place.
+///
+/// The usual cause of a mismatch is a daemon left running from an older build, which this fixes;
+/// the caller checks again afterwards, since it does not always.
+pub fn restart() -> Result<(), String> {
+    // A daemon that is already gone is not an error: what matters is that none is running by the
+    // time a new one starts.
+    let _ = ipc::send(&Command::Quit);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if !is_running() {
+            return spawn();
+        }
+
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    Err("the daemon would not stop".to_string())
+}
+
 pub fn is_running() -> bool {
     ipc::send(&Command::Status).is_ok()
 }

@@ -324,6 +324,7 @@ ok: queued 24 from Late Night by title
 | `clear` | Stop and forget the queue and history |
 | `status` | Report what is playing, as JSON, including what repeats and what any streams are called |
 | `interfaces` | How many interfaces are attached |
+| `version`, `protocol` | Which version of the socket protocol the daemon speaks |
 | `quit`, `close` | Kill the daemon, whoever is attached |
 
 Names need no quoting — arguments are joined, so `ogma-cmd load_playlist Late Night` works. Hyphens
@@ -382,6 +383,44 @@ The protocol is one line of text in, one line out, so it can be driven by hand:
 ```sh
 printf 'volume -10\n' | nc -U "${XDG_RUNTIME_DIR}/ogma.sock"
 ```
+
+### Protocol versions
+
+The interface and the daemon are separate programs talking over a socket, so they can end up being
+different builds — a daemon left running from before an upgrade, or two copies installed in
+different places. Left alone they would misread each other quietly, which is worse than not
+starting.
+
+So `ogma` asks first. On start-up it sends `version`; if the answer is not the version it speaks,
+it stops that daemon and starts one from its own installation, then asks again. That fixes the
+common case — an old daemon still running — without saying anything.
+
+If the second answer still does not match, the interface stops and shows what it found:
+
+```
+╭──────────── version mismatch ────────────╮
+│ ogma and ogma-daemon are different       │
+│ builds.                                  │
+│                                          │
+│ ogma speaks        IPC version 2         │
+│ ogma-daemon speaks IPC version 1         │
+│ …                                        │
+╰─ any key closes ogma and stops the daemon ─╯
+```
+
+Any key closes the player and stops the daemon with it, so the next run starts clean rather than
+finding the same wrong version again. A daemon too old to know the `version` command is reported as
+"an older version, which cannot say which" — not knowing how to answer is itself an answer.
+
+`ogma-cmd version` asks the same question by hand:
+
+```sh
+$ ogma-cmd version
+ok: ipc 1
+```
+
+The number goes up whenever a command or a reply changes shape in a way the other side could
+misread. Installing the three binaries together — `cargo install --path .` — keeps them in step.
 
 ### Files and environment
 

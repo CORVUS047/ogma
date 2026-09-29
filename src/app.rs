@@ -16,8 +16,8 @@ use crate::remote::Remote;
 use crate::player::Player;
 use crate::theme::Theme;
 use crate::ui::{
-    ConfigMenu, ConfigMenuOutcome, FolderBrowser, FolderBrowserOutcome, PlayerScreen,
-    PlayerScreenOutcome, StartMenu, StartMenuChoice,
+    ConfigMenu, ConfigMenuOutcome, FolderBrowser, FolderBrowserOutcome, MismatchOutcome,
+    MismatchPane, PlayerScreen, PlayerScreenOutcome, StartMenu, StartMenuChoice,
 };
 
 /// How long the loop waits for a key before catching up with the audio.
@@ -32,6 +32,8 @@ pub enum ScreenKind {
     Config,
     Browse,
     Play,
+    /// The dead end shown when the daemon speaks a different protocol.
+    Mismatch,
 }
 
 /// Which screen has the user's attention.
@@ -41,6 +43,7 @@ enum Screen {
     Config(ConfigMenu),
     Browse(FolderBrowser),
     Play(Box<PlayerScreen>),
+    Mismatch(MismatchPane),
 }
 
 /// The running player.
@@ -58,6 +61,11 @@ pub struct App {
     theme: Theme,
     /// Why the daemon could not be started, if it could not.
     daemon_error: Option<String>,
+    /// The protocol versions that did not match, when they did not: ours, and the daemon's.
+    ///
+    /// Set only after restarting the daemon failed to fix it. While it is set the interface does
+    /// nothing but say so, and stops the daemon when it closes.
+    protocol_mismatch: Option<(u32, Option<u32>)>,
     /// The player screen, set aside while another screen is showing.
     ///
     /// Leaving the player does not stop it — the audio keeps going — so the screen is kept rather
@@ -75,6 +83,7 @@ impl Screen {
             Screen::Config(_) => ScreenKind::Config,
             Screen::Browse(_) => ScreenKind::Browse,
             Screen::Play(_) => ScreenKind::Play,
+            Screen::Mismatch(_) => ScreenKind::Mismatch,
         }
     }
 }
@@ -96,12 +105,38 @@ impl Default for App {
             }
         }
 
+        // Before anything is asked of the daemon, ask whether it speaks the same protocol. A
+        // daemon left running from an older build is the usual reason it does not, so one is
+        // stopped and started again from this installation before giving up on it.
+        let mut protocol_mismatch = None;
+
+        if let daemon::Handshake::Mismatch { ours, theirs } = daemon::handshake() {
+            match daemon::restart() {
+                Ok(()) => {
+                    started_daemon = true;
+
+                    if let daemon::Handshake::Mismatch { ours, theirs } = daemon::handshake() {
+                        protocol_mismatch = Some((ours, theirs));
+                    }
+                }
+                // It could not be replaced, so what is there is what there is.
+                Err(err) => {
+                    protocol_mismatch = Some((ours, theirs));
+                    daemon_error = Some(err);
+                }
+            }
+        }
+
         let mut remote = Remote::new();
 
         // Being counted among the daemon's interfaces is what keeps it playing when one of several
         // interfaces closes. It is told who started it, so the last one out is the one that closes it.
-        remote.attach(started_daemon);
-        remote.refresh();
+        // A daemon that speaks another protocol is not attached to: it would be one more command
+        // for it to misread, and this interface is about to close anyway.
+        if protocol_mismatch.is_none() {
+            remote.attach(started_daemon);
+            remote.refresh();
+        }
 
         let theme = Theme::load(config.custom_theme());
 
@@ -109,14 +144,27 @@ impl Default for App {
         menu.set_hints(config.show_control_hints());
         menu.set_theme(theme);
 
+        // A mismatch is a dead end: the interface says which versions it found and waits to be
+        // closed, rather than driving a daemon that may act on something else entirely.
+        let screen = match protocol_mismatch {
+            Some((ours, theirs)) => {
+                let mut pane = MismatchPane::new(ours, theirs);
+                pane.set_theme(theme);
+
+                Screen::Mismatch(pane)
+            }
+            None => Screen::Start(menu),
+        };
+
         let mut app = App {
-            screen: Screen::Start(menu),
+            screen,
             // A configured folder is the library root until the user picks another.
             library_root: config.default_folder().map(PathBuf::from),
             config,
             remote,
             started_daemon,
             daemon_error,
+            protocol_mismatch,
             fills: None,
             theme,
             suspended: None,
@@ -125,8 +173,10 @@ impl Default for App {
 
         // With a folder already configured there is nothing to ask about: go straight to the player.
         // A folder that has since been moved or removed is not usable, so that falls back to the
-        // menu, where it can be pointed somewhere else.
-        if let Some(folder) = app.config.default_folder().map(PathBuf::from)
+        // menu, where it can be pointed somewhere else. None of that applies while the daemon is
+        // the wrong version: there is nothing to play it with.
+        if app.protocol_mismatch.is_none()
+            && let Some(folder) = app.config.default_folder().map(PathBuf::from)
             && folder.is_dir()
         {
             app.open_library(&folder);
@@ -187,6 +237,13 @@ impl App {
     /// The wish goes to the daemon rather than being acted on here: another interface may still be
     /// driving it, and a daemon somebody else is still listening to is not this interface's to stop.
     fn part_with_daemon(&mut self) {
+        // A daemon this interface cannot talk to is no use to anything, and leaving it running
+        // would have the next interface find the same wrong version and say the same thing again.
+        if self.protocol_mismatch.is_some() {
+            self.remote.quit_daemon();
+            return;
+        }
+
         let on_leave = match self.config.daemon_on_close() {
             DaemonOnClose::Stop => OnLeave::Stop,
             DaemonOnClose::StopIfWeStartedIt => OnLeave::StopIfSpawned,
@@ -271,6 +328,7 @@ impl App {
             Screen::Config(menu) => menu.render(frame, area, &self.config),
             Screen::Browse(browser) => browser.render(frame, area),
             Screen::Play(screen) => screen.render(frame, area, self.remote.player()),
+            Screen::Mismatch(pane) => pane.render(frame, area),
         }
     }
 
@@ -309,6 +367,11 @@ impl App {
             Screen::Play(screen) => {
                 if let Some(PlayerScreenOutcome::Close) = screen.handle_key(key, &mut self.remote) {
                     self.suspend_player();
+                }
+            }
+            Screen::Mismatch(pane) => {
+                if let Some(MismatchOutcome::Quit) = pane.handle_key(key) {
+                    self.running = false;
                 }
             }
         }
@@ -354,6 +417,8 @@ impl App {
                 browser.set_messages(messages);
             }
             Screen::Config(menu) => menu.set_messages(messages),
+            // Nothing in the config reaches a screen that exists to be closed.
+            Screen::Mismatch(_) => {}
         }
     }
 
@@ -503,6 +568,12 @@ impl App {
     /// Whether this interface started the daemon it is driving.
     pub fn started_daemon(&self) -> bool {
         self.started_daemon
+    }
+
+    /// The protocol versions that did not match, when they did not: this build's, and the
+    /// daemon's — `None` for a daemon too old to be asked.
+    pub fn protocol_mismatch(&self) -> Option<(u32, Option<u32>)> {
+        self.protocol_mismatch
     }
 
     /// Why the daemon cannot be reached, if it cannot.

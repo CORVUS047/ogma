@@ -475,6 +475,21 @@ fn a_stream() -> ipc::StreamTrack {
 }
 
 #[test]
+fn the_daemon_says_which_protocol_it_speaks() {
+    let mut daemon = bare_daemon();
+
+    let reply = daemon.apply(Command::Version);
+
+    assert_eq!(reply, ipc::version_reply());
+    assert_eq!(ipc::parse_version(&reply), Some(ipc::PROTOCOL_VERSION));
+
+    // Asked for from a script, and by the hyphenated spelling a command line invites.
+    assert_eq!(Command::parse("version"), Ok(Command::Version));
+    assert_eq!(Command::parse("protocol"), Ok(Command::Version));
+    assert_eq!(Command::Version.to_line(), "version");
+}
+
+#[test]
 fn a_stream_survives_the_trip_over_the_socket() {
     let command = Command::PlayStream(a_stream());
     let line = command.to_line();
