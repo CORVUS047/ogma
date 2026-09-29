@@ -15,6 +15,8 @@ pub enum StartMenuChoice {
     Continue,
     /// Pick a folder to build the library from.
     SelectFolder,
+    /// Search YouTube, to stream or to download.
+    SearchYoutube,
     /// Open the config screen.
     OpenConfig,
     /// Leave the player.
@@ -23,12 +25,14 @@ pub enum StartMenuChoice {
 
 impl StartMenuChoice {
     /// The entries always offered, in the order they are stacked.
-    const ALWAYS: [StartMenuChoice; 3] = [Self::SelectFolder, Self::OpenConfig, Self::Quit];
+    const ALWAYS: [StartMenuChoice; 4] =
+        [Self::SelectFolder, Self::SearchYoutube, Self::OpenConfig, Self::Quit];
 
     fn label(self) -> &'static str {
         match self {
             Self::Continue => "Continue",
             Self::SelectFolder => "Select Folder",
+            Self::SearchYoutube => "Search YouTube",
             Self::OpenConfig => "Open Config",
             Self::Quit => "Quit",
         }
@@ -39,6 +43,7 @@ impl StartMenuChoice {
         match self {
             Self::Continue => "Back to what is playing",
             Self::SelectFolder => "Scan a folder for music",
+            Self::SearchYoutube => "Stream or download with yt-dlp",
             Self::OpenConfig => "Audio output, theme, keys",
             Self::Quit => "Close ogma",
         }
@@ -74,7 +79,7 @@ impl StartMenu {
     /// Continue comes first and starts highlighted, so leaving the player by accident costs one key
     /// to undo.
     pub fn with_continue(resumable: bool) -> Self {
-        let mut entries = Vec::with_capacity(4);
+        let mut entries = Vec::with_capacity(StartMenuChoice::ALWAYS.len() + 1);
 
         if resumable {
             entries.push(StartMenuChoice::Continue);

@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::ytdl::{self, Format};
+
 /// The file the config lives in, inside the platform's config directory.
 const FILE_NAME: &str = "config.toml";
 
@@ -108,6 +110,18 @@ pub struct Config {
     /// What becomes of the playback daemon when the interface closes.
     #[serde(default)]
     daemon_on_close: DaemonOnClose,
+    /// Where tracks downloaded from YouTube are written.
+    ///
+    /// Unset means the platform's music folder under the player's own name, which keeps downloads
+    /// out of a library the user arranged by hand.
+    download_folder: Option<String>,
+    /// What a downloaded track is kept as. Unconverted by default: YouTube's audio is already
+    /// lossy, so re-encoding it only takes more away.
+    #[serde(default)]
+    download_format: Format,
+    /// How many results a YouTube search asks for.
+    #[serde(default = "default_search_results")]
+    search_results: usize,
     /// Whether to draw with the colours in `theme.toml` rather than the terminal's own palette.
     ///
     /// Off by default: a player should look like it belongs in the terminal it was opened in until
@@ -118,6 +132,11 @@ pub struct Config {
 /// Default for [`Config::show_control_hints`], which is on.
 fn yes() -> bool {
     true
+}
+
+/// Default for [`Config::search_results`]: enough to scroll through, few enough to read.
+fn default_search_results() -> usize {
+    ytdl::DEFAULT_RESULTS
 }
 
 /// What happens to the playback daemon when the interface closes.
@@ -184,6 +203,9 @@ impl Default for Config {
             show_control_hints: true,
             hide_status_messages: false,
             daemon_on_close: DaemonOnClose::default(),
+            download_folder: None,
+            download_format: Format::default(),
+            search_results: default_search_results(),
             custom_theme: false,
         }
     }
@@ -228,6 +250,7 @@ impl Config {
 
                 // The file is hand-editable, so nothing in it can be trusted to be in range.
                 config.master_volume = config.master_volume.clamp(0.0, 1.0);
+                config.search_results = config.search_results.clamp(1, ytdl::MAX_RESULTS);
 
                 Ok(config)
             }
@@ -361,6 +384,50 @@ impl Config {
         self.daemon_on_close = self.daemon_on_close.next();
 
         self.daemon_on_close
+    }
+
+    /// Where downloads are written, when the config names somewhere.
+    pub fn download_folder(&self) -> Option<&Path> {
+        self.download_folder.as_ref().map(Path::new)
+    }
+
+    /// Write downloads to `path`, which need not exist yet: it is created when one is started.
+    pub fn set_download_folder(&mut self, path: &Path) -> Result<(), ConfigError> {
+        let path_string = path.to_str().ok_or(ConfigError::FailedToConvertPathToString)?;
+
+        self.download_folder = Some(path_string.to_string());
+
+        Ok(())
+    }
+
+    /// Go back to the default download folder.
+    pub fn clear_download_folder(&mut self) {
+        self.download_folder = None;
+    }
+
+    /// What a downloaded track is kept as.
+    pub fn download_format(&self) -> Format {
+        self.download_format
+    }
+
+    pub fn set_download_format(&mut self, format: Format) {
+        self.download_format = format;
+    }
+
+    /// Move to the next format, returning it.
+    pub fn cycle_download_format(&mut self) -> Format {
+        self.download_format = self.download_format.next();
+
+        self.download_format
+    }
+
+    /// How many results a search asks for.
+    pub fn search_results(&self) -> usize {
+        self.search_results.clamp(1, ytdl::MAX_RESULTS)
+    }
+
+    pub fn set_search_results(&mut self, count: usize) {
+        self.search_results = count.clamp(1, ytdl::MAX_RESULTS);
     }
 
     /// Whether the colours come from `theme.toml` rather than the terminal's palette.

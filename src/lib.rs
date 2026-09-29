@@ -15,3 +15,4 @@ pub mod song;
 pub mod theme;
 pub mod ui;
 pub mod volume;
+pub mod ytdl;

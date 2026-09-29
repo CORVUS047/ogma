@@ -160,13 +160,31 @@ fn where_the_application_starts_and_how_it_comes_back() {
         "and came back where it was, rather than at the library root"
     );
 
-    // --- a setting changed in the config reaches the player that was set aside ---
-    assert!(frame_of(&mut app).contains("+/-"), "the keys start out listed");
-
-    // To the menu, down to Open Config, and in.
+    // --- the YouTube screen is a menu entry away, and comes straight back ---
     press(&mut app, KeyCode::Esc);
     press(&mut app, KeyCode::Down);
     press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.screen(), ScreenKind::Youtube);
+
+    // It opens ready to be typed into, and escape with nothing found is the way out.
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(app.screen(), ScreenKind::Start);
+
+    // Continue is waiting where it was, the detour having changed nothing.
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.screen(), ScreenKind::Play);
+    assert_eq!(app.browsing_path(), Some(inside.as_path()));
+
+    // --- a setting changed in the config reaches the player that was set aside ---
+    assert!(frame_of(&mut app).contains("+/-"), "the keys start out listed");
+
+    // To the menu, down to Open Config, and in. Continue, Select Folder and Search YouTube sit
+    // above it.
+    press(&mut app, KeyCode::Esc);
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down);
+    }
     press(&mut app, KeyCode::Enter);
     assert_eq!(app.screen(), ScreenKind::Config);
 
@@ -189,8 +207,9 @@ fn where_the_application_starts_and_how_it_comes_back() {
 
     // And back on again, without reopening the library.
     press(&mut app, KeyCode::Esc);
-    press(&mut app, KeyCode::Down);
-    press(&mut app, KeyCode::Down);
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Down);
+    }
     press(&mut app, KeyCode::Enter);
     for _ in 0..4 {
         press(&mut app, KeyCode::Down);

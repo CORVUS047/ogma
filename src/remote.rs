@@ -8,10 +8,10 @@
 use std::path::Path;
 use std::time::Duration;
 
-use crate::ipc::{self, Attachment, Command, OnLeave, Status};
+use crate::ipc::{self, Attachment, Command, OnLeave, Status, StreamTrack};
 use crate::player::{Controls, Mirrored, PlaybackState, Player, Repeat};
 use crate::playlist::Playlist;
-use crate::song::Song;
+use crate::song::{Song, StreamInfo};
 
 /// A connection to the daemon, and the mirror it keeps up to date.
 #[derive(Debug)]
@@ -137,13 +137,27 @@ impl Remote {
         // of it still says what is playing.
         let repeat = Repeat::parse(&status.repeat).unwrap_or_default();
 
+        // The daemon sends paths; the ones that are URLs come with what they are called, so the
+        // screen lists a streamed track by its title rather than by its link.
+        let named = |path: &Path| -> Song {
+            let uri = path.to_string_lossy();
+
+            match status.streams.iter().find(|track| track.url == uri) {
+                Some(track) => track.song(),
+                None if crate::ytdl::is_stream(&uri) => {
+                    Song::stream(&uri, StreamInfo::default())
+                }
+                None => Song::new(path),
+            }
+        };
+
         self.mirror.mirror(Mirrored {
             state,
             position: Duration::from_millis(status.position_ms),
             volume: status.volume,
-            current: status.current.as_deref().map(Song::new),
-            queue: status.queue.iter().map(Song::new).collect(),
-            history: status.history.iter().map(Song::new).collect(),
+            current: status.current.as_deref().map(named),
+            queue: status.queue.iter().map(|path| named(path)).collect(),
+            history: status.history.iter().map(|path| named(path)).collect(),
             repeat,
         });
     }
@@ -242,16 +256,30 @@ impl Controls for Remote {
     }
 
     fn add_queue(&mut self, song: Song) {
-        let path = song.path().to_path_buf();
+        // A stream is queued by URL and title together: the daemon has no file to read a name from.
+        let command = match StreamTrack::of(&song) {
+            Some(track) => Command::QueueStream(track),
+            None => Command::QueueAdd(song.path().to_path_buf()),
+        };
+
         Controls::add_queue(&mut self.mirror, song);
-        self.send(Command::QueueAdd(path));
+        self.send(command);
     }
 
     fn add_queue_all(&mut self, songs: Vec<Song>) {
         let paths: Vec<std::path::PathBuf> =
             songs.iter().map(|song| song.path().to_path_buf()).collect();
 
+        // What the daemon cannot work out for itself goes first: a queue is sent as bare URIs, so a
+        // stream it has never been told about would arrive nameless. Naming them here means the
+        // queue that follows finds them already known.
+        let streams: Vec<StreamTrack> = songs.iter().filter_map(StreamTrack::of).collect();
+
         Controls::add_queue_all(&mut self.mirror, songs);
+
+        for track in streams {
+            self.send(Command::QueueStream(track));
+        }
 
         // One command for the lot: a folder of a thousand tracks should not be a thousand exchanges.
         let mut queue: Vec<std::path::PathBuf> =
@@ -272,9 +300,13 @@ impl Controls for Remote {
     }
 
     fn play_now(&mut self, song: Song) {
-        let path = song.path().to_path_buf();
+        let command = match StreamTrack::of(&song) {
+            Some(track) => Command::PlayStream(track),
+            None => Command::PlayFile(song.path().to_path_buf()),
+        };
+
         Controls::play_now(&mut self.mirror, song);
-        self.send(Command::PlayFile(path));
+        self.send(command);
     }
 
     fn play_queued(&mut self, index: usize) {
@@ -283,7 +315,16 @@ impl Controls for Remote {
     }
 
     fn replace_queue_with_playlist(&mut self, playlist: &Playlist) {
+        let streams: Vec<StreamTrack> =
+            playlist.ordered().iter().filter_map(|song| StreamTrack::of(song)).collect();
+
         Controls::replace_queue_with_playlist(&mut self.mirror, playlist);
+
+        // As for a queue of songs: the daemon is told what the streams are before it is told to
+        // play them, or it would have only their URLs to show.
+        for track in streams {
+            self.send(Command::QueueStream(track));
+        }
 
         let paths: Vec<std::path::PathBuf> =
             playlist.ordered().iter().map(|song| song.path().to_path_buf()).collect();

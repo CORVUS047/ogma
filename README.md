@@ -5,7 +5,7 @@ ogma is a terminal music player in three pieces:
 
 | Binary | What it is |
 | --- | --- |
-| `ogma` | the TUI: browse, queue, playlists, config |
+| `ogma` | the TUI: browse, queue, playlists, search YouTube, config |
 | `ogma-daemon` | playback. Holds the queue and drives the audio device. Keeps playing with no interface attached, and never stops while one is |
 | `ogma-cmd` | one-shot commands to a running daemon, for keybindings and scripts |
 
@@ -34,6 +34,19 @@ sudo emerge --ask media-libs/alsa-lib dev-util/pkgconf
 ```
 
 macOS needs no extra packages; `cpal` uses CoreAudio.
+
+Optional, for the YouTube screen: [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) on `PATH`, and
+`ffmpeg` for downloads. Without them the rest of the player works as it always did and the screen
+says what is missing.
+
+```sh
+sudo apt install yt-dlp ffmpeg      # Debian/Ubuntu
+sudo dnf install yt-dlp ffmpeg      # Fedora
+sudo pacman -S yt-dlp ffmpeg        # Arch
+sudo emerge --ask net-misc/yt-dlp media-video/ffmpeg   # Gentoo
+```
+
+`$OGMA_YTDLP` names the program to run, for a yt-dlp kept somewhere unusual.
 
 ### Build from source
 
@@ -90,7 +103,8 @@ Nothing is queued on open. The queue is yours to fill from the file listing.
 | enter, space | Choose |
 | `q`, esc | Quit |
 
-**Continue** only appears once there is a player screen to go back to.
+**Continue** only appears once there is a player screen to go back to. **Search YouTube** opens the
+search screen below.
 
 #### Folder browser
 
@@ -186,6 +200,36 @@ Only a song **ending by itself** is affected. `n` and `p` always move on and bac
 are for. The one exception is the end of the queue with queue repeat on, where `n` wraps round to the
 start rather than stopping, since there is always a next song.
 
+#### YouTube:
+
+Type a query, press enter, and pick from what comes back. A result can be **streamed** — played
+straight from the network, with nothing written to disk — or **downloaded** into the download
+folder, where it is an ordinary file the library scan picks up.
+
+| Key | Does |
+| --- | --- |
+| `/`, `s` | Type a new query |
+| enter | Stream the highlighted result now |
+| `a` | Queue the chosen results, to stream when they come round |
+| `d` | Download the chosen results |
+| space | Mark a result |
+| `m` | Mark everything, or clear the marks |
+| `j` `k` `g` `G`, page up / down | Move |
+| `q`, esc | Back to the menu |
+
+"Chosen" means the marked results, or the highlighted one when nothing is marked.
+
+Streamed tracks sit in the queue beside local files and play the same way, with two differences:
+they cannot be seeked (the audio arrives as it plays), and they are listed by what the search said
+rather than by tags, since there is no file to read any. Searching and downloading both run on their
+own threads, so the screen stays usable while they work.
+
+Downloads are named `Artist - Title`, with tags and cover art embedded where the format and the
+installed helpers allow; a cover that cannot be embedded costs the track its picture, not the
+download.
+
+What this fetches is between you and the rights holder — yt-dlp is the same tool either way.
+
 #### Configuration:
 
 <img width="1856" height="1044" alt="image" src="https://github.com/user-attachments/assets/2f0609b5-15ff-48b0-8524-90d59e39ac8c" />
@@ -199,6 +243,9 @@ start rather than stopping, since there is always a next song.
 | Control hints | Whether the keys are listed on each screen. On by default, and applies as soon as the config is left — the player waiting behind Continue included |
 | Hide messages | Silences what an action reports. The failures share that line, so turning it on hides those too. Applies straight away, like the hints |
 | On close | What becomes of the daemon when the **last** interface closes: keep it if it was started by hand (default), always kill it, or always keep it. Closing one of several interfaces never stops playback — see [Several interfaces at once](#several-interfaces-at-once) |
+| Downloads | Where YouTube downloads are written. `enter` types a path, `d` goes back to the default: `Downloads` beside the library, or the platform's music folder under `ogma` when no library is set |
+| Download as | What a downloaded track is kept as: as served (default, no re-encoding), opus, mp3, m4a or flac. Converting needs `ffmpeg` |
+| Search results | How many hits a YouTube search asks for. Left / right adjust, 5 at a time |
 | Theme | Colours from `theme.toml` instead of the terminal's palette. Restart to apply |
 
 `s` saves. `q` or esc leaves; unsaved edits are still live for the session, but only the file survives
@@ -231,11 +278,13 @@ ok: queued 24 from Late Night by title
 | `load_playlist <name>` | Replace the queue with a playlist |
 | `add_playlist <name>` | Add a playlist to the end of the queue |
 | `play_song <name>` | Find a song in the library and play it |
+| `play_stream <url>` | Play a track from the network now, e.g. a YouTube URL |
+| `queue_stream <url>` | Add a track from the network to the queue |
 | `volume <±points>` | Move the volume, e.g. `10` or `-5` |
 | `seek <±seconds>` | Move the position, e.g. `30` or `-10` |
 | `stop` | Halt playback and rewind, keeping the queue |
 | `clear` | Stop and forget the queue and history |
-| `status` | Report what is playing, as JSON, including what repeats |
+| `status` | Report what is playing, as JSON, including what repeats and what any streams are called |
 | `interfaces` | How many interfaces are attached |
 | `quit`, `close` | Kill the daemon, whoever is attached |
 

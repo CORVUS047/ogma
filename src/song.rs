@@ -1,10 +1,23 @@
-//! A track on disk, and the metadata it reports.
+//! A track on disk — or arriving over the network — and the metadata it reports.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::meta::{self, Artwork, AudioFile, MetaError};
+
+/// What is known about a track that is not a file: a YouTube result being streamed, chiefly.
+///
+/// A stream has no tags to read, so what the search said about it is carried here and answered in
+/// place of them. Nothing else about a [`Song`] changes: the URL sits where the path would, so the
+/// queue, the playlists and the daemon handle streams and files alike.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StreamInfo {
+    pub title: Option<String>,
+    /// Who it is by, as far as the source knows — for YouTube, the channel that uploaded it.
+    pub artist: Option<String>,
+    pub duration: Option<Duration>,
+}
 
 /// One track, identified by its path.
 ///
@@ -18,12 +31,44 @@ pub struct Song {
     path: PathBuf,
     /// Shared so that cloning a song into a queue does not mean reading the file twice.
     meta: Arc<OnceLock<Result<Box<dyn AudioFile>, MetaError>>>,
+    /// Set when the path is a URL to stream rather than a file to open.
+    stream: Option<StreamInfo>,
 }
 
 impl Song {
     /// Point at a file without reading it.
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Song { path: path.into(), meta: Arc::new(OnceLock::new()) }
+        Song { path: path.into(), meta: Arc::new(OnceLock::new()), stream: None }
+    }
+
+    /// A track played from `uri` rather than from disk, described by what the search said.
+    ///
+    /// The metadata cache is filled in with the failure up front, so nothing ever tries to open a
+    /// URL as a file: every tag accessor answers from [`StreamInfo`] or not at all.
+    pub fn stream(uri: &str, info: StreamInfo) -> Self {
+        let meta = OnceLock::new();
+        let _ = meta.set(Err(MetaError::Unreadable {
+            path: PathBuf::from(uri),
+            symphonia: None,
+            lofty: None,
+        }));
+
+        Song { path: PathBuf::from(uri), meta: Arc::new(meta), stream: Some(info) }
+    }
+
+    /// Whether this plays from the network rather than from a file.
+    pub fn is_stream(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    /// What the source said about a streamed track, if this is one.
+    pub fn stream_info(&self) -> Option<&StreamInfo> {
+        self.stream.as_ref()
+    }
+
+    /// The path as the text that crosses the socket, which for a stream is its URL.
+    pub fn uri(&self) -> String {
+        self.path.to_string_lossy().into_owned()
     }
 
     /// Point at a file and read it now, failing if it cannot be read.
@@ -62,6 +107,12 @@ impl Song {
     /// Needed when something has changed the file underneath us — filling in missing artwork, for
     /// instance. Clones made before this keep their own cache.
     pub fn refresh(&mut self) {
+        // A stream has nothing on disk to re-read, and clearing the cache would have the next
+        // access try to open its URL as a file.
+        if self.stream.is_some() {
+            return;
+        }
+
         self.meta = Arc::new(OnceLock::new());
     }
 
@@ -89,10 +140,18 @@ impl Song {
     // ------------------------------------------------------------------------------------- tags
 
     pub fn title(&self) -> Option<&str> {
+        if let Some(stream) = &self.stream {
+            return stream.title.as_deref();
+        }
+
         self.meta()?.title()
     }
 
     pub fn artist(&self) -> Option<&str> {
+        if let Some(stream) = &self.stream {
+            return stream.artist.as_deref();
+        }
+
         self.meta()?.artist()
     }
 
@@ -153,6 +212,10 @@ impl Song {
     // -------------------------------------------------------------------------------- the stream
 
     pub fn duration(&self) -> Option<Duration> {
+        if let Some(stream) = &self.stream {
+            return stream.duration;
+        }
+
         self.meta()?.duration()
     }
 
@@ -188,6 +251,12 @@ impl Song {
     pub fn display_title(&self) -> String {
         if let Some(title) = self.title() {
             return title.to_string();
+        }
+
+        // A URL has no file name worth showing, so the whole of it is better than the last path
+        // segment of a query string.
+        if self.stream.is_some() {
+            return self.path.display().to_string();
         }
 
         self.path

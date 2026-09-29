@@ -28,10 +28,10 @@ use symphonia::core::codecs::audio::AudioDecoder;
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatReader, SeekMode, SeekTo, TrackType};
-use symphonia::core::io::MediaSourceStream;
+use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::units::Time;
 
-use crate::{meta, volume};
+use crate::{meta, volume, ytdl};
 
 /// Roughly how much audio the ring buffer holds. Enough to ride out a slow disk or a busy CPU,
 /// short enough that a seek does not have much to throw away.
@@ -239,8 +239,23 @@ impl AudioEngine {
         self.shared.playing.store(false, Ordering::Relaxed);
     }
 
+    /// Whether what is open arrived over the network, and so cannot be moved within.
+    pub fn is_streaming(&self) -> bool {
+        self.loaded
+            .as_ref()
+            .is_some_and(|path| ytdl::is_stream(&path.to_string_lossy()))
+    }
+
     /// Jump to `position` within the open file.
+    ///
+    /// A stream is read straight through as it arrives, with nothing to jump back to and no index
+    /// to jump forward by, so this does nothing to one: the clock stays where the sound is rather
+    /// than being moved to a position the audio never reached.
     pub fn seek(&self, position: Duration) -> Result<(), AudioError> {
+        if self.is_streaming() {
+            return Ok(());
+        }
+
         self.shared.finished.store(false, Ordering::Relaxed);
         self.shared.rebase(position);
 
@@ -484,12 +499,61 @@ struct OpenTrack {
     resampled: Vec<f32>,
 }
 
+/// Audio arriving from yt-dlp rather than from a file.
+///
+/// Reports itself as unseekable and of unknown length, which is what tells the demuxer to read
+/// straight through rather than looking for an index it cannot reach. Seeking within a stream
+/// therefore fails, and the daemon simply keeps playing where it is.
+struct Piped {
+    stream: ytdl::Stream,
+}
+
+impl std::io::Read for Piped {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.stream.read(buf)
+    }
+}
+
+impl std::io::Seek for Piped {
+    fn seek(&mut self, _to: std::io::SeekFrom) -> std::io::Result<u64> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "a stream cannot be seeked",
+        ))
+    }
+}
+
+impl MediaSource for Piped {
+    fn is_seekable(&self) -> bool {
+        false
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        None
+    }
+}
+
 impl OpenTrack {
     fn open(path: &Path, shared: &Shared) -> Result<Self, SymphoniaError> {
-        let file = std::fs::File::open(path)?;
-        let mss = MediaSourceStream::new(Box::new(file), Default::default());
+        let uri = path.to_string_lossy();
 
-        let mut hint = Hint::new();
+        // A URL is played through yt-dlp, which writes the audio to a pipe; anything else is a file.
+        let (source, mut hint): (Box<dyn MediaSource>, Hint) = if ytdl::is_stream(&uri) {
+            let stream = ytdl::Stream::new(&uri)
+                .map_err(|err| SymphoniaError::IoError(std::io::Error::other(err)))?;
+
+            let mut hint = Hint::new();
+            // What the stream format asks yt-dlp for, and what it nearly always serves. A wrong
+            // hint only costs the probe a guess; the bytes themselves decide.
+            hint.with_extension("webm");
+
+            (Box::new(Piped { stream }), hint)
+        } else {
+            (Box::new(std::fs::File::open(path)?), Hint::new())
+        };
+
+        let mss = MediaSourceStream::new(source, Default::default());
+
         if let Some(extension) = path.extension().and_then(|ext| ext.to_str()) {
             hint.with_extension(extension);
         }

@@ -19,6 +19,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::player::Repeat;
+use crate::song::{Song, StreamInfo};
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -37,6 +38,95 @@ const SOCKET_ENV: &str = "OGMA_SOCKET";
 ///
 /// The player answers from its event loop, which wakes ten times a second, so this is generous.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A track the daemon plays from a URL rather than from disk, and what to call it.
+///
+/// A stream carries no tags to read, so whatever found it — the YouTube search, for now — says what
+/// it is, and that travels with the URL. Without this the queue would list raw URLs, since the
+/// daemon has nothing else to go on.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct StreamTrack {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artist: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
+impl StreamTrack {
+    /// Everything known about `song`, for a song that is streamed.
+    pub fn of(song: &Song) -> Option<Self> {
+        let info = song.stream_info()?;
+
+        Some(StreamTrack {
+            url: song.uri(),
+            title: info.title.clone(),
+            artist: info.artist.clone(),
+            duration_ms: info.duration.map(|length| length.as_millis() as u64),
+        })
+    }
+
+    /// The song this describes, ready to be queued.
+    pub fn song(&self) -> Song {
+        Song::stream(
+            &self.url,
+            StreamInfo {
+                title: self.title.clone(),
+                artist: self.artist.clone(),
+                duration: self.duration_ms.map(Duration::from_millis),
+            },
+        )
+    }
+
+    /// The tab-separated fields that carry this on one line.
+    ///
+    /// Tabs again, as for a queue of paths: neither a URL nor a title can contain one, so nothing
+    /// needs escaping. Empty fields stand for what is not known.
+    fn to_fields(&self) -> String {
+        let seconds = match self.duration_ms {
+            Some(millis) => (millis / 1000).to_string(),
+            None => String::new(),
+        };
+
+        format!(
+            "{}\t{}\t{}\t{seconds}",
+            self.url,
+            self.title.as_deref().unwrap_or_default(),
+            self.artist.as_deref().unwrap_or_default(),
+        )
+    }
+
+    /// Read back what [`StreamTrack::to_fields`] wrote.
+    ///
+    /// Only the URL is required: a caller with nothing else to say — `ogma-cmd play_stream <url>`
+    /// from a script, say — sends that alone.
+    fn parse_fields(what: &str, argument: &str) -> Result<Self, String> {
+        let mut fields = argument.split('\t');
+
+        let url = fields.next().unwrap_or_default().trim();
+
+        if url.is_empty() {
+            return Err(format!("{what} needs a url"));
+        }
+
+        let text = |field: Option<&str>| -> Option<String> {
+            field
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+
+        let title = text(fields.next());
+        let artist = text(fields.next());
+        let duration_ms = text(fields.next())
+            .and_then(|seconds| seconds.parse::<u64>().ok())
+            .map(|seconds| seconds * 1000);
+
+        Ok(StreamTrack { url: url.to_string(), title, artist, duration_ms })
+    }
+}
 
 /// What `ogma-cmd` can ask for.
 #[derive(Clone, Debug, PartialEq)]
@@ -81,6 +171,10 @@ pub enum Command {
     QueueClear,
     /// Start this file now, sending whatever was playing to the history.
     PlayFile(PathBuf),
+    /// Add a track played from the network to the end of the queue.
+    QueueStream(StreamTrack),
+    /// Start a track played from the network now.
+    PlayStream(StreamTrack),
     /// Start the queue entry at this position now.
     PlayIndex(usize),
     /// Move the position by this many seconds, forwards or back.
@@ -207,6 +301,12 @@ impl Command {
                 Ok(Command::QueueAddFolder(PathBuf::from(needs_name("queue_add_folder")?)))
             }
             "play_file" => Ok(Command::PlayFile(PathBuf::from(needs_name("play_file")?))),
+            "play_stream" => {
+                StreamTrack::parse_fields("play_stream", argument).map(Command::PlayStream)
+            }
+            "queue_stream" => {
+                StreamTrack::parse_fields("queue_stream", argument).map(Command::QueueStream)
+            }
             "set_queue" => {
                 // Paths are separated by tabs, which cannot appear in a path on any system this runs
                 // on, so no escaping is needed.
@@ -283,6 +383,8 @@ impl Command {
             Command::QueueAdd(path) => format!("queue_add {}", path.display()),
             Command::QueueAddFolder(path) => format!("queue_add_folder {}", path.display()),
             Command::PlayFile(path) => format!("play_file {}", path.display()),
+            Command::PlayStream(track) => format!("play_stream {}", track.to_fields()),
+            Command::QueueStream(track) => format!("queue_stream {}", track.to_fields()),
             Command::QueueRemove(index) => format!("queue_remove {index}"),
             Command::PlayIndex(index) => format!("play_index {index}"),
             Command::Seek(seconds) => format!("seek {seconds}"),
@@ -317,6 +419,8 @@ impl Command {
             ("load_playlist <name>", "replace the queue with a playlist"),
             ("add_playlist <name>", "add a playlist to the end of the queue"),
             ("play_song <name>", "find a song in the library and play it"),
+            ("play_stream <url>", "play a track from the network, e.g. a YouTube URL"),
+            ("queue_stream <url>", "add a track from the network to the queue"),
             ("volume <±points>", "move the volume, e.g. 10 or -5"),
             ("seek <±seconds>", "move the position, e.g. 30 or -10"),
             ("stop", "halt playback and rewind, keeping the queue"),
@@ -351,6 +455,11 @@ pub struct Status {
     /// Defaulted, so a status from a daemon that predates repeat still reads.
     #[serde(default)]
     pub repeat: String,
+    /// What the entries above that are URLs rather than files are, so an interface can name them.
+    ///
+    /// Empty for a daemon playing only local files, and left out of the JSON entirely then.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub streams: Vec<StreamTrack>,
 }
 
 impl Status {

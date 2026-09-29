@@ -7,7 +7,7 @@
 //!
 //! Both `ogma-cmd` and the terminal interface are clients of this.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -17,7 +17,8 @@ use crate::ipc::{self, Command, OnLeave, Status};
 use crate::library;
 use crate::player::{PlaybackState, Player};
 use crate::playlist::Playlist;
-use crate::song::Song;
+use crate::song::{Song, StreamInfo};
+use crate::ytdl;
 use crate::volume;
 
 /// How often the daemon looks at the clock and the socket.
@@ -41,6 +42,12 @@ pub struct Daemon {
     /// What keeps the music on when one of several interfaces closes: a leaving interface can ask for
     /// the daemon to stop, and is only listened to once this is empty.
     interfaces: HashSet<String>,
+    /// What is known about the streamed tracks the daemon has been handed, by URL.
+    ///
+    /// A stream has no tags to read, so the titles arrive with the command that queued it. They are
+    /// kept here rather than only on the [`Song`] so that a queue sent back as bare URLs — a
+    /// reorder, a shuffle from an interface — still knows what its entries are called.
+    streams: HashMap<String, StreamInfo>,
     /// Whether an interface is what started this daemon, rather than it having been started by hand.
     ///
     /// Any interface that says so on attaching sets this, and it is never unset: a daemon spawned for
@@ -86,6 +93,7 @@ impl Daemon {
             audio_error,
             library_root: config.default_folder().map(Path::to_path_buf),
             interfaces: HashSet::new(),
+            streams: HashMap::new(),
             spawned_by_interface: false,
             running: true,
         }
@@ -150,7 +158,48 @@ impl Daemon {
             queue: self.player.queue().iter().map(|song| song.path().to_path_buf()).collect(),
             history: self.player.history().iter().map(|song| song.path().to_path_buf()).collect(),
             repeat: self.player.repeat().word().to_string(),
+            streams: self.streamed_entries(),
         }
+    }
+
+    /// What the daemon knows about the streams among what it is playing, for the interface to name
+    /// them by. Only the ones actually in play: the registry outlives a queue, the status does not.
+    fn streamed_entries(&self) -> Vec<ipc::StreamTrack> {
+        let mut seen = HashSet::new();
+
+        self.player
+            .current()
+            .into_iter()
+            .chain(self.player.queue())
+            .chain(self.player.history())
+            .filter_map(ipc::StreamTrack::of)
+            .filter(|track| seen.insert(track.url.clone()))
+            .collect()
+    }
+
+    /// The song `uri` names: a stream when it is a URL this daemon has been told about, or when it
+    /// is a URL at all, and a file otherwise.
+    fn song_for(&self, uri: &str) -> Song {
+        if let Some(info) = self.streams.get(uri) {
+            return Song::stream(uri, info.clone());
+        }
+
+        if ytdl::is_stream(uri) {
+            return Song::stream(uri, StreamInfo::default());
+        }
+
+        Song::new(uri)
+    }
+
+    /// Remember what a streamed track is called, so a later bare URL still lists properly.
+    fn remember_stream(&mut self, track: &ipc::StreamTrack) -> Song {
+        let song = track.song();
+
+        if let Some(info) = song.stream_info() {
+            self.streams.insert(track.url.clone(), info.clone());
+        }
+
+        song
     }
 
     /// The queue and what is playing, for anything driving the daemon in-process.
@@ -247,6 +296,12 @@ impl Daemon {
                 )
             }
             Command::Seek(seconds) => {
+                // A stream arrives as it plays: there is nothing behind the point it has reached
+                // and nothing ahead of it yet, so saying so beats a seek that quietly does nothing.
+                if self.player.current().is_some_and(|song| song.is_stream()) {
+                    return "error: a stream cannot be seeked".to_string();
+                }
+
                 let position = self.player.position();
 
                 let moved = if seconds.is_negative() {
@@ -262,7 +317,7 @@ impl Daemon {
 
             // --- the queue ---
             Command::QueueAdd(path) => {
-                let song = Song::new(&path);
+                let song = self.song_for(&path.to_string_lossy());
                 let title = song.display_title();
                 self.player.add_queue(song);
 
@@ -286,19 +341,43 @@ impl Daemon {
             }
             Command::SetQueue(paths) => {
                 let count = paths.len();
-                self.player.replace_queue(paths.into_iter().map(Song::new));
+                // Built through `song_for`, so a URL that was queued with a title keeps it rather
+                // than coming back as a bare link.
+                let songs: Vec<Song> = paths
+                    .iter()
+                    .map(|path| self.song_for(&path.to_string_lossy()))
+                    .collect();
+
+                self.player.replace_queue(songs);
 
                 format!("ok: queue of {count}")
             }
             Command::PlayFile(path) => {
-                if !path.exists() {
+                let uri = path.to_string_lossy().into_owned();
+
+                // A URL is a stream, and has no file to look for; anything else must exist before
+                // there is any point in trying to play it.
+                if !ytdl::is_stream(&uri) && !path.exists() {
                     return format!("error: no such file {}", path.display());
                 }
 
-                let song = Song::new(&path);
+                let song = self.song_for(&uri);
                 self.player.play_now(song);
 
                 self.playing_now()
+            }
+            Command::PlayStream(track) => {
+                let song = self.remember_stream(&track);
+                self.player.play_now(song);
+
+                self.playing_now()
+            }
+            Command::QueueStream(track) => {
+                let song = self.remember_stream(&track);
+                let title = song.display_title();
+                self.player.add_queue(song);
+
+                format!("ok: queued {title}")
             }
             Command::PlayIndex(index) => match self.player.remove_queue(index) {
                 Some(song) => {

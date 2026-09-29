@@ -446,3 +446,104 @@ fn the_player_carries_out_every_command_and_says_what_came_of_it() {
     assert!(!daemon.is_running(), "the loop is asked to end");
 }
 
+
+// ------------------------------------------------------------------ tracks played from the network
+
+/// A daemon with no library behind it, for the commands that need none.
+///
+/// Built straight from a default config rather than through [`daemon_with_library`], which points
+/// the environment at a scratch config: these tests run alongside that one, and two tests moving
+/// `XDG_CONFIG_HOME` under each other is a race. yt-dlp is pointed at a program that does nothing,
+/// so a stream the daemon decides to load asks the network for nothing.
+fn bare_daemon() -> Daemon {
+    // SAFETY: as for the other tests here — one variable, set to the same value by each of them.
+    unsafe {
+        std::env::set_var("OGMA_YTDLP", "true");
+    }
+
+    Daemon::with_config(&Config::default())
+}
+
+/// A YouTube result, as the interface would send one.
+fn a_stream() -> ipc::StreamTrack {
+    ipc::StreamTrack {
+        url: "https://www.youtube.com/watch?v=aaaaaaaaaaa".to_string(),
+        title: Some("First Song".to_string()),
+        artist: Some("A Channel".to_string()),
+        duration_ms: Some(131_000),
+    }
+}
+
+#[test]
+fn a_stream_survives_the_trip_over_the_socket() {
+    let command = Command::PlayStream(a_stream());
+    let line = command.to_line();
+
+    assert_eq!(Command::parse(&line), Ok(command), "what is written reads back the same: {line}");
+
+    // A script has only the URL to give, and that is enough.
+    assert_eq!(
+        Command::parse("queue_stream https://www.youtube.com/watch?v=bbbbbbbbbbb"),
+        Ok(Command::QueueStream(ipc::StreamTrack {
+            url: "https://www.youtube.com/watch?v=bbbbbbbbbbb".to_string(),
+            ..ipc::StreamTrack::default()
+        }))
+    );
+
+    assert!(Command::parse("play_stream").is_err(), "a stream needs something to play");
+}
+
+#[test]
+fn the_player_queues_and_plays_what_comes_from_the_network() {
+    let mut daemon = bare_daemon();
+
+    let reply = daemon.apply(Command::QueueStream(a_stream()));
+    assert_eq!(reply, "ok: queued First Song");
+
+    let queued = &daemon.player().queue()[0];
+    assert!(queued.is_stream(), "it plays from the network rather than from disk");
+    assert_eq!(queued.title(), Some("First Song"));
+    assert_eq!(queued.duration(), Some(Duration::from_secs(131)));
+
+    let reply = daemon.apply(Command::PlayStream(a_stream()));
+    assert!(reply.contains("First Song"), "{reply}");
+
+    // A URL is not a file that has gone missing.
+    let reply = daemon.apply(Command::PlayFile(PathBuf::from(
+        "https://www.youtube.com/watch?v=ccccccccccc",
+    )));
+    assert!(!reply.contains("no such file"), "{reply}");
+}
+
+#[test]
+fn the_status_says_what_the_streams_in_the_queue_are_called() {
+    let mut daemon = bare_daemon();
+
+    daemon.apply(Command::QueueAdd(PathBuf::from("/music/not-really-there.flac")));
+    daemon.apply(Command::QueueStream(a_stream()));
+
+    let status = daemon.status();
+
+    assert_eq!(status.streams.len(), 1, "only the stream needs naming; the file has its own tags");
+    assert_eq!(status.streams[0].title.as_deref(), Some("First Song"));
+    assert_eq!(status.streams[0].url, a_stream().url);
+
+    // And it reads back out of the JSON the interface receives.
+    let sent = Status::parse(&status.to_json()).expect("a status");
+    assert_eq!(sent.streams, status.streams);
+}
+
+#[test]
+fn a_queue_sent_back_as_bare_urls_keeps_its_titles() {
+    let mut daemon = bare_daemon();
+
+    daemon.apply(Command::QueueStream(a_stream()));
+
+    // What an interface does when it reorders the queue: the whole of it, as paths, with no room
+    // for a title. The daemon remembers what it was told.
+    daemon.apply(Command::SetQueue(vec![PathBuf::from(a_stream().url)]));
+
+    let queued = &daemon.player().queue()[0];
+    assert!(queued.is_stream());
+    assert_eq!(queued.title(), Some("First Song"), "the name did not go with the round trip");
+}

@@ -17,6 +17,9 @@ const VOLUME_STEP: f32 = 0.05;
 /// Cells in the volume bar.
 const BAR_CELLS: usize = 20;
 
+/// How many results one key press adds to or takes off a search.
+const RESULTS_STEP: i32 = 5;
+
 /// The settings the screen can edit, in the order they are listed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Field {
@@ -27,11 +30,14 @@ enum Field {
     ShowControlHints,
     HideStatusMessages,
     DaemonOnClose,
+    DownloadFolder,
+    DownloadFormat,
+    SearchResults,
     CustomTheme,
 }
 
 impl Field {
-    const ALL: [Field; 8] = [
+    const ALL: [Field; 11] = [
         Self::MasterVolume,
         Self::DefaultFolder,
         Self::AutoFillMetadata,
@@ -39,6 +45,9 @@ impl Field {
         Self::ShowControlHints,
         Self::HideStatusMessages,
         Self::DaemonOnClose,
+        Self::DownloadFolder,
+        Self::DownloadFormat,
+        Self::SearchResults,
         Self::CustomTheme,
     ];
 
@@ -51,6 +60,9 @@ impl Field {
             Self::ShowControlHints => "Control hints",
             Self::HideStatusMessages => "Hide messages",
             Self::DaemonOnClose => "On close",
+            Self::DownloadFolder => "Downloads",
+            Self::DownloadFormat => "Download as",
+            Self::SearchResults => "Search results",
             Self::CustomTheme => "Theme",
         }
     }
@@ -64,6 +76,9 @@ impl Field {
             Self::ShowControlHints => "enter toggle · lists the keys on each screen",
             Self::HideStatusMessages => "enter toggle · silences what an action reports",
             Self::DaemonOnClose => "enter cycles · what happens to playback when closed",
+            Self::DownloadFolder => "enter edit path · d clear · where YouTube downloads land",
+            Self::DownloadFormat => "enter cycles · what a downloaded track is kept as",
+            Self::SearchResults => "left/right adjust · how many hits a search asks for",
             Self::CustomTheme => "enter toggle · colours from theme.toml, restart to apply",
         }
     }
@@ -73,8 +88,9 @@ impl Field {
 #[derive(Debug)]
 enum Mode {
     Browsing,
-    /// Typing a folder path. Holds the text so far, so Esc can abandon it.
-    EditingFolder { buffer: String },
+    /// Typing a folder path into one of the path fields. Holds the text so far, so Esc can abandon
+    /// it, and which field it belongs to, since two of them are paths.
+    EditingPath { field: Field, buffer: String },
 }
 
 /// What the screen asks the application to do next.
@@ -169,7 +185,7 @@ impl ConfigMenu {
         match &mut self.mode {
             Mode::Browsing => self.handle_browsing_key(key, config),
             // Borrow the buffer for the duration of the edit, so typing does not clone it per key.
-            Mode::EditingFolder { .. } => {
+            Mode::EditingPath { .. } => {
                 self.handle_editing_key(key, config);
                 None
             }
@@ -185,7 +201,13 @@ impl ConfigMenu {
             KeyCode::Down | KeyCode::Char('j') => self.select_next(),
             KeyCode::Up | KeyCode::Char('k') => self.select_previous(),
 
-            // Adjusting a value. Only the volume responds to these.
+            // Adjusting a value. The volume and the result count are what respond to these.
+            KeyCode::Left | KeyCode::Char('h') if self.selected() == Field::SearchResults => {
+                self.nudge_results(config, -RESULTS_STEP)
+            }
+            KeyCode::Right | KeyCode::Char('l') if self.selected() == Field::SearchResults => {
+                self.nudge_results(config, RESULTS_STEP)
+            }
             KeyCode::Left | KeyCode::Char('h') => self.nudge_volume(config, -VOLUME_STEP),
             KeyCode::Right | KeyCode::Char('l') => self.nudge_volume(config, VOLUME_STEP),
 
@@ -278,8 +300,31 @@ impl ConfigMenu {
                     .map(|path| path.display().to_string())
                     .unwrap_or_default();
 
-                self.mode = Mode::EditingFolder { buffer };
+                self.mode = Mode::EditingPath { field: Field::DefaultFolder, buffer };
                 self.status = None;
+            }
+
+            KeyCode::Enter if self.selected() == Field::DownloadFolder => {
+                let buffer = config
+                    .download_folder()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
+
+                self.mode = Mode::EditingPath { field: Field::DownloadFolder, buffer };
+                self.status = None;
+            }
+
+            KeyCode::Char('d') | KeyCode::Delete if self.selected() == Field::DownloadFolder => {
+                config.clear_download_folder();
+                self.unsaved = true;
+                self.ok("Downloads go to the default folder");
+            }
+
+            KeyCode::Enter | KeyCode::Char(' ') if self.selected() == Field::DownloadFormat => {
+                let format = config.cycle_download_format();
+                self.unsaved = true;
+
+                self.ok(format.describe());
             }
 
             KeyCode::Char('d') | KeyCode::Delete if self.selected() == Field::DefaultFolder => {
@@ -306,9 +351,11 @@ impl ConfigMenu {
     }
 
     fn handle_editing_key(&mut self, key: KeyEvent, config: &mut Config) {
-        let Mode::EditingFolder { buffer } = &mut self.mode else {
+        let Mode::EditingPath { field, buffer } = &mut self.mode else {
             return;
         };
+
+        let field = *field;
 
         match key.code {
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => buffer.push(c),
@@ -326,18 +373,40 @@ impl ConfigMenu {
                 self.mode = Mode::Browsing;
 
                 if entered.is_empty() {
-                    config.clear_default_folder();
+                    match field {
+                        Field::DownloadFolder => {
+                            config.clear_download_folder();
+                            self.ok("Downloads go to the default folder");
+                        }
+                        _ => {
+                            config.clear_default_folder();
+                            self.ok("Default folder cleared");
+                        }
+                    }
+
                     self.unsaved = true;
-                    self.ok("Default folder cleared");
                     return;
                 }
 
                 let path = expand_home(&entered);
 
-                match config.set_default_folder(&path) {
+                // The download folder is made when a download starts, so it need not exist yet;
+                // a library folder that is not there has nothing to scan.
+                let result = match field {
+                    Field::DownloadFolder => config.set_download_folder(&path),
+                    _ => config.set_default_folder(&path),
+                };
+
+                match result {
                     Ok(()) => {
                         self.unsaved = true;
-                        self.ok(format!("Default folder set to {}", path.display()));
+
+                        match field {
+                            Field::DownloadFolder => {
+                                self.ok(format!("Downloads go to {}", path.display()))
+                            }
+                            _ => self.ok(format!("Default folder set to {}", path.display())),
+                        }
                     }
                     Err(err) => self.failed(format!("{}: {err}", path.display())),
                 }
@@ -370,6 +439,17 @@ impl ConfigMenu {
         self.report_volume(config);
     }
 
+    /// Ask for more or fewer search results.
+    fn nudge_results(&mut self, config: &mut Config, change: i32) {
+        let wanted = config.search_results() as i32 + change;
+
+        config.set_search_results(wanted.max(1) as usize);
+        self.unsaved = true;
+
+        let count = config.search_results();
+        self.ok(format!("Searches ask for {count} results"));
+    }
+
     /// Say where the fader now sits, in both the fader's terms and the ear's.
     fn report_volume(&mut self, config: &Config) {
         let level = *config.get_master_volume();
@@ -397,7 +477,10 @@ impl ConfigMenu {
 
     /// Draw the screen centered in `area`.
     pub fn render(&mut self, frame: &mut Frame<'_>, area: Rect, config: &Config) {
-        let menu_area = area.centered(Constraint::Length(62), Constraint::Length(16));
+        // The fields, the hint and the status line, with the spacing, padding and borders around
+        // them.
+        let height = Field::ALL.len() as u16 + 8;
+        let menu_area = area.centered(Constraint::Length(62), Constraint::Length(height));
 
         let title = if self.unsaved { " Config · unsaved " } else { " Config " };
 
@@ -435,7 +518,7 @@ impl ConfigMenu {
 
         let hint = match &self.mode {
             Mode::Browsing => self.selected().hint(),
-            Mode::EditingFolder { .. } => "enter apply · esc cancel · ctrl-u clear",
+            Mode::EditingPath { .. } => "enter apply · esc cancel · ctrl-u clear",
         };
         frame.render_widget(Line::from(hint).style(self.theme.muted()).centered(), hint_area);
 
@@ -531,12 +614,8 @@ impl ConfigMenu {
             }
             Field::DefaultFolder => match &self.mode {
                 // While editing, the row becomes the input, with a block for the cursor.
-                Mode::EditingFolder { buffer } if self.selected() == Field::DefaultFolder => {
-                    vec![
-                        Span::from(buffer.clone())
-                            .style(self.theme.text().add_modifier(Modifier::UNDERLINED)),
-                        Span::from("█").style(self.theme.accent()),
-                    ]
+                Mode::EditingPath { field: Field::DefaultFolder, buffer } => {
+                    typing_spans(buffer, &self.theme)
                 }
                 _ => match config.default_folder() {
                     Some(path) => {
@@ -545,6 +624,34 @@ impl ConfigMenu {
                     None => vec![Span::from("not set").style(self.theme.muted())],
                 },
             },
+            Field::DownloadFolder => match &self.mode {
+                Mode::EditingPath { field: Field::DownloadFolder, buffer } => {
+                    typing_spans(buffer, &self.theme)
+                }
+                _ => match config.download_folder() {
+                    Some(path) => {
+                        vec![Span::from(path.display().to_string()).style(self.theme.text())]
+                    }
+                    // Where they go when nothing is set depends on the platform, so the row says
+                    // what will happen rather than a path that may not be the one used.
+                    None => vec![
+                        Span::from("default").style(self.theme.muted()),
+                        Span::from("   beside the library, else the music folder")
+                            .style(self.theme.muted()),
+                    ],
+                },
+            },
+            Field::DownloadFormat => {
+                let format = config.download_format();
+
+                vec![
+                    Span::from(format.label()).style(self.theme.text()),
+                    Span::from(format!("   {}", format.describe())).style(self.theme.muted()),
+                ]
+            }
+            Field::SearchResults => {
+                vec![Span::from(config.search_results().to_string()).style(self.theme.text())]
+            }
         };
 
         let mut spans = vec![Span::from(label).style(self.theme.text())];
@@ -552,6 +659,14 @@ impl ConfigMenu {
 
         Line::from(spans)
     }
+}
+
+/// A field being typed into: what is there so far, and a block for the cursor.
+fn typing_spans(buffer: &str, theme: &Theme) -> Vec<Span<'static>> {
+    vec![
+        Span::from(buffer.to_string()).style(theme.text().add_modifier(Modifier::UNDERLINED)),
+        Span::from("█").style(theme.accent()),
+    ]
 }
 
 /// A bar of filled and empty cells for a 0.0 to 1.0 level.
