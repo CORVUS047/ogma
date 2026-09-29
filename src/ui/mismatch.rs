@@ -68,8 +68,9 @@ impl MismatchPane {
         match self.theirs {
             Some(version) => format!("IPC version {version}"),
             // A daemon that does not know the question predates the answer, which places it before
-            // version 1 without saying where.
-            None => "an older version, which cannot say which".to_string(),
+            // version 1 without saying where. The rest of that is said on the line below, since
+            // this one has a label in front of it and the box is only so wide.
+            None => "an older version".to_string(),
         }
     }
 
@@ -86,7 +87,7 @@ impl MismatchPane {
             )
             .padding(Padding::uniform(1));
 
-        let lines = vec![
+        let mut lines = vec![
             Line::from("ogma and ogma-daemon are different builds.").style(self.theme.text()),
             Line::from(""),
             Line::from(vec![
@@ -99,13 +100,23 @@ impl MismatchPane {
                 Span::from(self.theirs_text())
                     .style(self.theme.error().add_modifier(Modifier::BOLD)),
             ]),
-            Line::from(""),
-            Line::from("The daemon was restarted once already and still").style(self.theme.text()),
-            Line::from("does not match, so the one on PATH is not from").style(self.theme.text()),
-            Line::from("this installation. Install the two together:").style(self.theme.text()),
-            Line::from(""),
-            Line::from("    cargo install --path .").style(self.theme.accent()),
         ];
+
+        if self.theirs.is_none() {
+            lines.push(
+                Line::from("                   too old to say which").style(self.theme.muted()),
+            );
+        }
+
+        lines.extend([
+            Line::from(""),
+            Line::from("Restarting the daemon did not change it,").style(self.theme.text()),
+            Line::from("so the ogma-daemon being started is not").style(self.theme.text()),
+            Line::from("from this build.").style(self.theme.text()),
+            Line::from(""),
+            Line::from("Install ogma, ogma-daemon and ogma-cmd").style(self.theme.text()),
+            Line::from("together, into one directory.").style(self.theme.text()),
+        ]);
 
         // Tall enough for the text, the padding and the borders; wide enough for the bottom title,
         // which is the longest line in the box.

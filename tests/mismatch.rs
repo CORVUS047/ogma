@@ -42,6 +42,7 @@ fn a_daemon_too_old_to_answer_is_described_rather_than_numbered() {
 
     assert!(frame.contains("IPC version 3"), "this build still says which: {frame}");
     assert!(frame.contains("an older version"), "{frame}");
+    assert!(frame.contains("too old to say which"), "and why it has no number: {frame}");
     assert!(!frame.contains("IPC version 0"), "a version it never claimed: {frame}");
 }
 
@@ -50,9 +51,30 @@ fn it_says_the_daemon_was_already_restarted_and_how_to_leave() {
     let mut pane = MismatchPane::new(2, Some(1));
     let frame = render(&mut pane);
 
-    assert!(frame.contains("restarted"), "the retry already happened: {frame}");
+    assert!(frame.contains("Restarting"), "the retry already happened: {frame}");
     assert!(frame.contains("any key closes ogma"), "{frame}");
     assert!(frame.contains("stops the daemon"), "{frame}");
+}
+
+#[test]
+fn nothing_it_says_runs_off_the_edge_of_the_box() {
+    // The box is a fixed width, so every line is checked whole: a sentence cut in half loses the
+    // part that says what to do about it.
+    for pane in [&mut MismatchPane::new(2, Some(1)), &mut MismatchPane::new(2, None)] {
+        let frame = render(pane);
+
+        for line in [
+            "ogma and ogma-daemon are different builds.",
+            "Restarting the daemon did not change it,",
+            "so the ogma-daemon being started is not",
+            "from this build.",
+            "Install ogma, ogma-daemon and ogma-cmd",
+            "together, into one directory.",
+            "any key closes ogma and stops the daemon",
+        ] {
+            assert!(frame.contains(line), "cut short: {line:?}\n{frame}");
+        }
+    }
 }
 
 #[test]
