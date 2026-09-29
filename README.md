@@ -60,15 +60,39 @@ Three binaries land in `target/release/`: `ogma`, `ogma-daemon`, `ogma-cmd`.
 
 ### Install
 
+Build, then put the three binaries in the usual place for locally built programs:
+
 ```sh
-cargo install --path .
+cargo build --release
+sudo install -Dm755 target/release/ogma        /usr/local/bin/ogma
+sudo install -Dm755 target/release/ogma-daemon /usr/local/bin/ogma-daemon
+sudo install -Dm755 target/release/ogma-cmd    /usr/local/bin/ogma-cmd
 ```
 
-That puts all three in `~/.cargo/bin`, which needs to be on `PATH`.
+`/usr/local/bin` is on `PATH` by default, so `ogma` works from anywhere afterwards. Somewhere else
+is fine as long as it is one directory for all three:
 
-`ogma` starts the daemon itself when none is running, looking for `ogma-daemon` beside its own
-executable, then one directory up, then on `PATH`. Keep the three together — installing them into the
-same directory is enough.
+```sh
+# just for you, no root needed; make sure ~/.local/bin is on PATH
+install -Dm755 target/release/ogma        ~/.local/bin/ogma
+install -Dm755 target/release/ogma-daemon ~/.local/bin/ogma-daemon
+install -Dm755 target/release/ogma-cmd    ~/.local/bin/ogma-cmd
+
+# a packaging run, staged under DESTDIR
+install -Dm755 target/release/ogma "$DESTDIR/usr/bin/ogma"
+```
+
+**Install all three together, from the same build.** `ogma` starts the daemon itself when none is
+running, looking for `ogma-daemon` beside its own executable, then one directory up, then on
+`PATH` — and the two check they speak the same protocol before doing anything, so a stale
+`ogma-daemon` from an older build is caught rather than obeyed. See
+[Protocol versions](#protocol-versions).
+
+To uninstall, delete what you copied:
+
+```sh
+sudo rm /usr/local/bin/ogma /usr/local/bin/ogma-daemon /usr/local/bin/ogma-cmd
+```
 
 Run it straight out of the build tree without installing:
 
@@ -117,7 +141,7 @@ into a folder before selecting it — the title says which one `s` would take.
 | `s`, space | Use the listed folder as the library |
 | `~` | Jump to your home folder |
 | `.` | Show or hide dotfolders |
-| `/` | Find in the listing; in youtube mode, start a query. Esc clears it |
+| `/` | Find in the listing; esc clears it |
 | `j` `k` `g` `G`, page up / down | Move |
 | `q`, esc | Back to the menu, changing nothing |
 
@@ -127,8 +151,8 @@ The choice is written to the config as soon as it is made, so there is nothing t
 
 <img width="1856" height="1044" alt="image" src="https://github.com/user-attachments/assets/5d1bfd9a-3bd3-497f-8ec2-59069393a056" />
 
-Three panes — playlists, files, queue — with cover art and the progress of what is playing. `tab`
-moves the focus; the keys below work wherever the focus is.
+Three panes — playlists, the multimodal panel, queue — with cover art and the progress of what is
+playing. `tab` moves the focus; the keys below work wherever the focus is.
 
 Under the progress bar is what the player is doing and where the fader sits — `▶ playing  vol
 █████░░░░░  50%  -10.0 dB`. It stays on screen with nothing playing, since that is the level the next
@@ -175,7 +199,9 @@ disk or out of a search.
 | `P` | Add the highlighted row to the selected playlist |
 | `x` | Pick the highlighted file or folder up to move it; again puts it back down |
 | `M` | Move everything held into the folder being listed |
-| `/` | Find in the listing; esc clears it |
+| `/` | Find in the listing — in youtube mode, start a query; esc clears it |
+| `t` | In browse mode, change what the tracks are filed under |
+| `d` | In youtube mode, download the highlighted result |
 | `j` `k` `g` `G`, page up / down | Move |
 
 In browse mode, `t` changes what the tracks are filed under. The groups are listed by name with the
@@ -420,7 +446,7 @@ ok: ipc 1
 ```
 
 The number goes up whenever a command or a reply changes shape in a way the other side could
-misread. Installing the three binaries together — `cargo install --path .` — keeps them in step.
+misread. [Installing the three together](#install), into one directory, keeps them in step.
 
 ### Files and environment
 
@@ -437,6 +463,7 @@ macOS keeps the config under `~/Library/Application Support/ogma/` instead. With
 | Variable | What |
 | --- | --- |
 | `OGMA_SOCKET` | Move the socket. Set it for both the daemon and `ogma-cmd` to run a second player |
+| `OGMA_YTDLP` | The yt-dlp to run, for one that is not `yt-dlp` on `PATH` |
 
 The config file is hand-editable. A missing file is written out with the defaults; a broken one is
 left alone and the defaults are used for that run, so a typo cannot lose your settings.
@@ -449,6 +476,9 @@ fetch_artwork_online = false
 show_control_hints = true
 hide_status_messages = false
 daemon_on_close = "stop_if_we_started_it"
+download_folder = "/home/you/Music/Downloads"
+download_format = "original"
+search_results = 20
 custom_theme = false
 ```
 
@@ -460,6 +490,13 @@ custom_theme = false
 
 ```sh
 cargo test
+```
+
+One test is left out of that run because it downloads from YouTube, and so needs `yt-dlp`, `ffmpeg`
+and a connection:
+
+```sh
+cargo test --test ytdl -- --ignored
 ```
 
 ## LICENSE
