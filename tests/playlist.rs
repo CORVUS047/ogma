@@ -289,3 +289,97 @@ fn deleting_removes_the_file_and_forgives_a_missing_one() {
     // that has no file is not an error to delete.
     assert!(playlist.delete().is_ok());
 }
+
+// ----------------------------------------------------------------- tracks played from the network
+
+/// A YouTube result, as the search would hand one over.
+fn a_stream() -> Song {
+    Song::stream(
+        "https://www.youtube.com/watch?v=aaaaaaaaaaa",
+        ogma::song::StreamInfo {
+            title: Some("First Song".to_string()),
+            artist: Some("A Channel".to_string()),
+            duration: Some(std::time::Duration::from_secs(131)),
+        },
+    )
+}
+
+#[test]
+fn a_stream_keeps_its_name_through_a_playlist() {
+    let (root, songs) = library("playlist-stream");
+    let path = root.join("mixed.toml");
+
+    let playlist = Playlist::with_songs("Mixed", [songs[0].clone(), a_stream()]);
+    playlist.save_to(&path).expect("save");
+
+    let back = Playlist::load_from(&path).expect("load");
+    let tracks = back.as_added();
+
+    assert_eq!(tracks.len(), 2, "both kinds of track came back");
+    assert!(!tracks[0].is_stream(), "the file is still a file");
+
+    let stream = &tracks[1];
+    assert!(stream.is_stream(), "and the URL is still something to stream");
+    assert_eq!(stream.title(), Some("First Song"));
+    assert_eq!(stream.display_artist(), "A Channel");
+    assert_eq!(stream.duration(), Some(std::time::Duration::from_secs(131)));
+    assert_eq!(stream.uri(), "https://www.youtube.com/watch?v=aaaaaaaaaaa");
+}
+
+#[test]
+fn a_stream_sorts_by_what_it_is_called() {
+    let (root, _songs) = library("playlist-stream-sort");
+    let path = root.join("streams.toml");
+
+    let later = Song::stream(
+        "https://www.youtube.com/watch?v=bbbbbbbbbbb",
+        ogma::song::StreamInfo {
+            title: Some("Zebra".to_string()),
+            artist: Some("B Channel".to_string()),
+            duration: Some(std::time::Duration::from_secs(90)),
+        },
+    );
+
+    let mut playlist = Playlist::with_songs("Streams", [later, a_stream()]);
+    playlist.set_sort(SortBy::Title);
+    playlist.save_to(&path).expect("save");
+
+    let back = Playlist::load_from(&path).expect("load");
+
+    assert_eq!(titles(&back), vec!["First Song", "Zebra"], "titles the sort can see");
+}
+
+#[test]
+fn the_tracks_are_still_a_plain_list_of_paths_on_disk() {
+    let (root, songs) = library("playlist-stream-format");
+    let path = root.join("mixed.toml");
+
+    Playlist::with_songs("Mixed", [songs[0].clone(), a_stream()])
+        .save_to(&path)
+        .expect("save");
+
+    let text = std::fs::read_to_string(&path).expect("read");
+
+    // The URL sits in `tracks` like any other entry, so a reader that knows nothing about streams
+    // still sees every track in order; the name lives beside it.
+    assert!(text.contains("https://www.youtube.com/watch?v=aaaaaaaaaaa"), "{text}");
+    assert!(text.contains("[[streams]]"), "{text}");
+    assert!(text.contains("First Song"), "{text}");
+}
+
+#[test]
+fn a_playlist_written_before_streams_existed_still_loads() {
+    let (root, songs) = library("playlist-old-format");
+    let path = root.join("old.toml");
+
+    let text = format!(
+        "name = \"Old\"\nsort = \"manual\"\ndescending = false\ntracks = [\"{}\"]\n",
+        songs[0].path().display()
+    );
+    std::fs::write(&path, text).expect("write");
+
+    let back = Playlist::load_from(&path).expect("load");
+
+    assert_eq!(back.len(), 1);
+    assert!(!back.as_added()[0].is_stream());
+}

@@ -138,9 +138,58 @@ struct OnDisk {
     sort: SortBy,
     #[serde(default)]
     descending: bool,
-    /// Paths, in the order the tracks were added.
+    /// Paths, in the order the tracks were added. A track played from the network is its URL, and
+    /// what it is called is in `streams` below.
     #[serde(default)]
     tracks: Vec<String>,
+    /// What the entries in `tracks` that are URLs are called.
+    ///
+    /// Kept beside the list rather than in it so that `tracks` stays a plain list of strings: a
+    /// playlist written by an older version still loads, and one written here still opens in
+    /// anything that only knows about paths. A stream has no tags to read, so without this it would
+    /// come back as its own link.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    streams: Vec<OnDiskStream>,
+}
+
+/// What a track played from the network is called, for the playlist file.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OnDiskStream {
+    url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    artist: Option<String>,
+    /// Length in whole seconds, which is all a listing shows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seconds: Option<u64>,
+}
+
+impl OnDiskStream {
+    /// What a streamed song should be written as, or `None` for a song that is a file.
+    fn of(song: &Song) -> Option<Self> {
+        let info = song.stream_info()?;
+
+        Some(OnDiskStream {
+            url: song.uri(),
+            title: info.title.clone(),
+            artist: info.artist.clone(),
+            seconds: info.duration.map(|length| length.as_secs()),
+        })
+    }
+
+    /// The song this describes.
+    fn song(&self) -> Song {
+        Song::stream(
+            &self.url,
+            crate::song::StreamInfo {
+                title: self.title.clone(),
+                artist: self.artist.clone(),
+                duration: self.seconds.map(std::time::Duration::from_secs),
+            },
+        )
+    }
 }
 
 impl Playlist {
@@ -321,11 +370,8 @@ impl Playlist {
             name: self.name.clone(),
             sort: self.sort,
             descending: self.descending,
-            tracks: self
-                .songs
-                .iter()
-                .map(|song| song.path().display().to_string())
-                .collect(),
+            tracks: self.songs.iter().map(|song| song.uri()).collect(),
+            streams: self.songs.iter().filter_map(OnDiskStream::of).collect(),
         };
 
         std::fs::write(path, toml::to_string_pretty(&on_disk)?)?;
@@ -338,9 +384,22 @@ impl Playlist {
         let text = std::fs::read_to_string(path)?;
         let on_disk: OnDisk = toml::from_str(&text)?;
 
+        // A track that one of the stream entries names comes back as a stream, with what it is
+        // called; everything else is a file, as it always was.
+        let songs = on_disk
+            .tracks
+            .into_iter()
+            .map(|track| {
+                match on_disk.streams.iter().find(|stream| stream.url == track) {
+                    Some(stream) => stream.song(),
+                    None => Song::new(track),
+                }
+            })
+            .collect();
+
         Ok(Playlist {
             name: on_disk.name,
-            songs: on_disk.tracks.into_iter().map(Song::new).collect(),
+            songs,
             sort: on_disk.sort,
             descending: on_disk.descending,
         })

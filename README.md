@@ -177,7 +177,10 @@ file where it was.
 A queued file keeps the path it was queued under, so moving it leaves the queue pointing where it
 used to be. Move first, queue after.
 
-Playlists pane:
+Playlists pane. A playlist holds tracks from YouTube as happily as files: the URL goes in the list
+with the title, artist and length beside it, so it comes back named rather than as a link. The
+`tracks` list itself stays a plain list of paths, so a playlist written by an older version still
+loads and one written now still opens in anything that only knows about files.
 
 | Key | Does |
 | --- | --- |
