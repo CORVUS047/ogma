@@ -69,37 +69,6 @@ sudo install -Dm755 target/release/ogma-daemon /usr/local/bin/ogma-daemon
 sudo install -Dm755 target/release/ogma-cmd    /usr/local/bin/ogma-cmd
 ```
 
-`/usr/local/bin` is on `PATH` by default, so `ogma` works from anywhere afterwards. Somewhere else
-is fine as long as it is one directory for all three:
-
-```sh
-# just for you, no root needed; make sure ~/.local/bin is on PATH
-install -Dm755 target/release/ogma        ~/.local/bin/ogma
-install -Dm755 target/release/ogma-daemon ~/.local/bin/ogma-daemon
-install -Dm755 target/release/ogma-cmd    ~/.local/bin/ogma-cmd
-
-# a packaging run, staged under DESTDIR
-install -Dm755 target/release/ogma "$DESTDIR/usr/bin/ogma"
-```
-
-**Install all three together, from the same build.** `ogma` starts the daemon itself when none is
-running, looking for `ogma-daemon` beside its own executable, then one directory up, then on
-`PATH` — and the two check they speak the same protocol before doing anything, so a stale
-`ogma-daemon` from an older build is caught rather than obeyed. See
-[Protocol versions](#protocol-versions).
-
-To uninstall, delete what you copied:
-
-```sh
-sudo rm /usr/local/bin/ogma /usr/local/bin/ogma-daemon /usr/local/bin/ogma-cmd
-```
-
-Run it straight out of the build tree without installing:
-
-```sh
-./target/release/ogma
-```
-
 ## USAGE
 
 ### First run
