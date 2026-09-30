@@ -6,7 +6,7 @@ ogma is a terminal music player in three pieces:
 | Binary | What it is |
 | --- | --- |
 | `ogma` | the TUI: browse, queue, playlists, search YouTube, config |
-| `ogma-daemon` | playback. Holds the queue and drives the audio device. Keeps playing with no interface attached, and never stops while one is |
+| `ogma-daemon` | playback. Holds the queue and drives the audio device |
 | `ogma-cmd` | one-shot commands to a running daemon, for keybindings and scripts |
 
 The interface only drives the daemon over a Unix socket, so closing the TUI does not have to stop the music.
