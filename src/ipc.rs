@@ -547,7 +547,9 @@ pub fn socket_path() -> PathBuf {
 }
 
 /// The user id, for naming a socket that is not shared.
-fn users_id() -> String {
+///
+/// Shared with [`crate::claim`], which names its folder the same way and for the same reason.
+pub(crate) fn users_id() -> String {
     std::env::var("UID")
         .ok()
         .or_else(|| std::env::var("USER").ok())

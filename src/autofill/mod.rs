@@ -20,6 +20,9 @@
 //! [`Config::auto_fill_metadata`](crate::config::Config::auto_fill_metadata) is on, and it only ever
 //! adds a picture to a file that has none. An existing picture is never replaced.
 //!
+//! A file is [claimed](crate::claim) for as long as it is being filled, so that two interfaces open
+//! on one library take turns over it rather than both rewriting it at once.
+//!
 //! **Looking online is a second, separate switch**
 //! ([`Config::fetch_artwork_online`](crate::config::Config::fetch_artwork_online)), also off by
 //! default: reading a file that is already on the machine and sending an album title to a third party
@@ -38,6 +41,7 @@ use lofty::picture::{Picture, PictureType};
 use lofty::probe::Probe;
 use lofty::tag::{ItemKey, Tag, TagType};
 
+use crate::claim;
 use crate::genre;
 use crate::library;
 use crate::meta;
@@ -96,6 +100,8 @@ pub enum Outcome {
     },
     /// Nothing could be found to fill in what was missing.
     NothingFound,
+    /// Another player holds the file, so it was left alone and will be looked at again.
+    Busy,
     /// The file's format can carry neither a picture nor a genre, so nothing was written.
     Unsupported,
     /// The file could not be read or written.
@@ -120,6 +126,8 @@ pub struct Report {
     pub genres: usize,
     pub already_present: usize,
     pub nothing_found: usize,
+    /// Files another player was writing to, which this run left for later.
+    pub busy: usize,
     /// Files whose format can hold neither.
     pub unsupported: usize,
     pub failed: usize,
@@ -238,6 +246,7 @@ where
             }
             Outcome::AlreadyPresent => report.already_present += 1,
             Outcome::NothingFound => report.nothing_found += 1,
+            Outcome::Busy => report.busy += 1,
             Outcome::Unsupported => report.unsupported += 1,
             Outcome::Failed(_) => report.failed += 1,
         }
@@ -385,10 +394,11 @@ fn pass(
         let outcome = fill_with(&path, &mut covers, settings);
 
         // A file that could not be read is left for the next pass: the usual reason is that it is
-        // still arriving — a download part-written, a copy in progress — and that fixes itself.
-        // Everything else is settled, and asking again every twenty seconds for the rest of the
-        // session would mean reading the whole library over and over.
-        if !matches!(outcome, Outcome::Failed(_)) {
+        // still arriving — a download part-written, a copy in progress — and that fixes itself. So
+        // is one another player holds, which it will not hold for long. Everything else is settled,
+        // and asking again every twenty seconds for the rest of the session would mean reading the
+        // whole library over and over.
+        if !matches!(outcome, Outcome::Failed(_) | Outcome::Busy) {
             handled.insert(path.clone());
         }
 
@@ -470,6 +480,14 @@ impl CoverCache {
 }
 
 fn fill_with(path: &Path, covers: &mut CoverCache, settings: Settings) -> Outcome {
+    // Several interfaces can be open on one library, each filling in metadata of its own accord, and
+    // two of them rewriting one file at the same moment is how a track gets truncated. The claim is
+    // held for the whole of this function: claiming only around the write would let the other player
+    // read the tags before this one has finished changing them.
+    let Some(_claim) = claim::Claim::on(path) else {
+        return Outcome::Busy;
+    };
+
     // Reading the tags is the only way to know what is missing.
     let mut tagged = match Probe::open(path).and_then(|probe| probe.read()) {
         Ok(tagged) => tagged,

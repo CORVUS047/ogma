@@ -305,6 +305,46 @@ fn dropping_the_watch_stops_it() {
 }
 
 #[test]
+fn a_file_another_player_is_writing_to_is_left_alone() {
+    let dir = common::scratch_dir("fill-claimed");
+    let track = track_without_art(&dir, "track.wav");
+    std::fs::write(dir.join("cover.png"), common::png_gradient(32)).expect("write cover");
+
+    // What another interface filling the same library looks like from here.
+    let held = ogma::claim::Claim::on(&track).expect("claim the track");
+
+    assert_eq!(autofill::fill(&track, Settings::local_only()), Outcome::Busy);
+    assert!(!has_art(&track), "nothing was written while it was held");
+
+    drop(held);
+
+    assert_eq!(autofill::fill(&track, Settings::local_only()), Outcome::artwork_from(dir.join("cover.png")));
+    assert!(has_art(&track), "and the next look fills it in");
+}
+
+#[test]
+fn a_watch_comes_back_to_a_file_it_found_busy() {
+    let dir = common::scratch_dir("fill-claimed-watch");
+    let track = track_without_art(&dir, "track.wav");
+    std::fs::write(dir.join("cover.png"), common::png_gradient(32)).expect("write cover");
+
+    let held = ogma::claim::Claim::on(&track).expect("claim the track");
+
+    let mut watch = autofill::watch_every(&dir, Settings::local_only(), SOON);
+
+    // Passes go by while the other player holds it, and none of them write.
+    std::thread::sleep(SEVERAL_PASSES);
+    assert_eq!(watch.collect(), Vec::<PathBuf>::new());
+    assert!(!has_art(&track));
+
+    drop(held);
+
+    // A busy file is not written off the way a settled one is, so the next pass picks it up.
+    assert_eq!(reported(&mut watch, 1), std::slice::from_ref(&track));
+    assert!(has_art(&track));
+}
+
+#[test]
 fn a_song_picks_up_art_after_a_refresh() {
     let dir = common::scratch_dir("fill-refresh");
     let track = track_without_art(&dir, "track.wav");
@@ -399,9 +439,10 @@ fn what_reaches_the_network_and_what_does_not() {
     autofill::fill_all(&tracks, Settings::with_online());
     let spent = autofill::online::requests_made() - before;
 
-    // The chain is at most a MusicBrainz search, a Cover Art Archive fetch and an iTunes fallback,
-    // so more than that from three tracks of one release is the cache failing.
-    assert!(spent <= 3, "three tracks of one album cost {spent} requests");
+    // The chain is at most a MusicBrainz search, a Cover Art Archive fetch, an iTunes fallback and
+    // a YouTube search for a thumbnail, so more than that from three tracks of one release is the
+    // cache failing.
+    assert!(spent <= 4, "three tracks of one album cost {spent} requests");
 }
 
 #[test]

@@ -4,6 +4,7 @@ pub mod app;
 pub mod audio;
 pub mod autofill;
 pub mod browse;
+pub mod claim;
 pub mod config;
 pub mod daemon;
 pub mod genre;

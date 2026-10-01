@@ -78,6 +78,26 @@ fn a_run_over_several_files_says_what_it_did() {
 }
 
 #[test]
+fn a_file_another_player_is_writing_to_is_reported_not_written() {
+    let dir = common::scratch_dir("genre-claimed");
+    let track = track(&dir, "track.wav");
+    let before = std::fs::read(&track).expect("read before");
+
+    // What the automatic filling looks like from here, in this interface or another.
+    let held = ogma::claim::Claim::on(&track).expect("claim the track");
+
+    // A genre typed in by hand waits its turn, then says it could not be written rather than writing
+    // over whatever the other player is in the middle of.
+    assert!(matches!(genre::set(&track, "Doom"), Outcome::Failed(_)));
+    assert_eq!(std::fs::read(&track).expect("read after"), before, "the file is untouched");
+
+    drop(held);
+
+    assert_eq!(genre::set(&track, "Doom"), Outcome::Written);
+    assert_eq!(genre_of(&track).as_deref(), Some("Doom"), "and it goes in once the file is free");
+}
+
+#[test]
 fn a_format_that_cannot_hold_a_genre_is_reported_not_written() {
     let dir = common::scratch_dir("genre-unsupported");
 

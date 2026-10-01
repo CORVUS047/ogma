@@ -4,6 +4,9 @@
 //! interface, where a genre is typed in by hand, and [`crate::autofill`], which fills in a genre a
 //! file is missing from what a service says about the release.
 //!
+//! A file is [claimed](crate::claim) before it is written, so that a genre typed in here and a
+//! genre the filling found cannot be written to one file at the same moment.
+//!
 //! **This writes to the user's music files.** A genre typed in by hand replaces whatever was there —
 //! that is what typing it means — while the automatic filling only ever writes into a file that has
 //! no genre at all. The two are deliberately different: one is an instruction, the other a guess.
@@ -70,6 +73,14 @@ impl Report {
 
 /// Write `genre` into `path`, replacing whatever genre was there.
 pub fn set(path: &Path, genre: &str) -> Outcome {
+    // The automatic filling writes to these same files, in this player and in any other interface
+    // the user has open, so the file is claimed first. This one waits for its turn rather than
+    // giving up at once: the user asked for this write by hand, and whatever holds the file is
+    // busy with it for milliseconds.
+    let Some(_claim) = crate::claim::Claim::waited_for(path) else {
+        return Outcome::Failed("another player is writing to this file".to_string());
+    };
+
     let mut tagged = match Probe::open(path).and_then(|probe| probe.read()) {
         Ok(tagged) => tagged,
         Err(err) => return Outcome::Failed(err.to_string()),
