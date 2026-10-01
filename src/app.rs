@@ -11,7 +11,6 @@ use crate::autofill;
 use crate::config::{Config, DaemonOnClose};
 use crate::ipc::OnLeave;
 use crate::daemon;
-use crate::library;
 use crate::remote::Remote;
 use crate::player::Player;
 use crate::theme::Theme;
@@ -55,8 +54,8 @@ pub struct App {
     remote: Remote,
     /// Whether this interface is what started the daemon, which decides what happens on close.
     started_daemon: bool,
-    /// Files that a background metadata fill has finished with, as they come in.
-    fills: Option<std::sync::mpsc::Receiver<PathBuf>>,
+    /// The background metadata fill, while one is watching the library.
+    fills: Option<autofill::Watch>,
     /// Colours every screen draws with.
     theme: Theme,
     /// Why the daemon could not be started, if it could not.
@@ -299,21 +298,21 @@ impl App {
     /// Take in whatever the background fill has finished.
     ///
     /// Nothing needs reloading: the mirror builds its songs from the daemon's paths on each refresh,
-    /// so a file that has just gained artwork is read afresh on the next tick.
+    /// so a file that has just gained artwork is read afresh on the next tick. The paths are taken in
+    /// all the same, rather than left to pile up in the channel for a session's worth of filling.
+    ///
+    /// The fill keeps watching for files that appear later, so it is not let go of when it falls
+    /// quiet — only when its thread has gone, which means it never started.
     fn collect_fills(&mut self) {
-        let Some(fills) = &self.fills else {
+        let Some(fills) = &mut self.fills else {
             return;
         };
 
-        loop {
-            match fills.try_recv() {
-                Ok(_) => {}
-                Err(std::sync::mpsc::TryRecvError::Empty) => return,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-            }
-        }
+        let _ = fills.collect();
 
-        self.fills = None;
+        if fills.ended() {
+            self.fills = None;
+        }
     }
 
     /// Draw whichever screen is showing.
@@ -420,6 +419,11 @@ impl App {
             // Nothing in the config reaches a screen that exists to be closed.
             Screen::Mismatch(_) => {}
         }
+
+        // Turning the filling on is a thing to do to a library, not a thing to do to the next
+        // library: it starts here rather than waiting for the folder to be opened again.
+        let root = self.library_root.clone();
+        self.sync_fills(root.as_deref());
     }
 
     /// Leave the player for the menu, keeping its screen to come back to.
@@ -447,22 +451,7 @@ impl App {
     /// Nothing is queued: the queue is the user's to fill from the file listing, rather than being
     /// handed a whole library in whatever order it happened to be scanned in.
     fn open_library(&mut self, root: &std::path::Path) {
-        // Filling in what files are missing runs alongside everything else: reading and writing a
-        // whole library takes long enough that waiting for it would look like a hang.
-        if self.config.auto_fill_metadata() {
-            let paths = library::scan(root)
-                .iter()
-                .map(|song| song.path().to_path_buf())
-                .collect();
-            // Each thing the filling may ask the internet for is its own switch, so the consents
-            // stay separate: covers and genres are turned on one at a time.
-            let settings = autofill::Settings {
-                online: self.config.fetch_artwork_online(),
-                genres: self.config.fetch_genres_online(),
-            };
-
-            self.fills = Some(autofill::fill_in_background(paths, settings));
-        }
+        self.sync_fills(Some(root));
 
         let mut screen = PlayerScreen::browsing(root);
         screen.set_hints(self.config.show_control_hints());
@@ -473,6 +462,44 @@ impl App {
         // A newly opened library is the player now; there is nothing older to go back to.
         self.suspended = None;
         self.screen = Screen::Play(Box::new(screen));
+    }
+
+    /// Start, stop or leave alone the background fill, as the config and `root` now ask.
+    ///
+    /// Filling runs alongside everything else: reading and writing a whole library takes long enough
+    /// that waiting for it would look like a hang. It also keeps watching the folder, so a track that
+    /// arrives after the library was opened — a download finishing, an album copied in — is filled in
+    /// without the user having to reopen anything.
+    ///
+    /// A fill already watching that folder under those settings is left running: restarting it would
+    /// walk the library again to learn what it already knows.
+    fn sync_fills(&mut self, root: Option<&std::path::Path>) {
+        // Each thing the filling may ask the internet for is its own switch, so the consents stay
+        // separate: covers and genres are turned on one at a time.
+        let settings = autofill::Settings {
+            online: self.config.fetch_artwork_online(),
+            genres: self.config.fetch_genres_online(),
+        };
+
+        // A folder that is not there is not watched: a default folder that has been moved away
+        // would otherwise leave a thread walking nothing for the session.
+        let wanted = root.filter(|root| self.config.auto_fill_metadata() && root.is_dir());
+
+        match wanted {
+            Some(root) => {
+                let running = self
+                    .fills
+                    .as_ref()
+                    .is_some_and(|fill| fill.root() == root && fill.settings() == settings);
+
+                if !running {
+                    self.fills = Some(autofill::watch(root, settings));
+                }
+            }
+            // Turned off, or there is no library to look at: anything still running is stopped by
+            // being dropped.
+            None => self.fills = None,
+        }
     }
 
     /// The start menu, dressed as the config asks.

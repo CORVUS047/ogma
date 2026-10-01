@@ -1,6 +1,6 @@
 //! Finding the music in a folder.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::meta;
 use crate::song::Song;
@@ -16,16 +16,24 @@ const MAX_DEPTH: usize = 8;
 /// Extensions are the filter here; nothing is opened. A file that turns out to be unreadable shows
 /// up as a [`Song`] whose metadata is `None`, which is what the UI displays as unknown.
 pub fn scan(root: &Path) -> Vec<Song> {
+    paths(root).into_iter().map(Song::new).collect()
+}
+
+/// The path of every audio file at or below `root`, sorted.
+///
+/// What [`scan`] is built on, for the sake of work that wants the files themselves rather than
+/// anything to display: the background metadata fill walks the library this way on every pass.
+pub fn paths(root: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     walk(root, 0, &mut paths);
 
     // Sorting by full path keeps disc and track files adjacent, which is the order they are named in.
     paths.sort();
 
-    paths.into_iter().map(Song::new).collect()
+    paths
 }
 
-fn walk(dir: &Path, depth: usize, found: &mut Vec<std::path::PathBuf>) {
+fn walk(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
     if depth > MAX_DEPTH {
         return;
     }

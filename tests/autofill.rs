@@ -3,6 +3,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use ogma::autofill::{self, Outcome, Settings};
 use ogma::song::Song;
@@ -196,30 +197,111 @@ fn a_format_that_cannot_hold_a_picture_is_skipped() {
     assert_eq!(std::fs::read(&track).expect("read after"), before, "left byte for byte alone");
 }
 
+/// Brisk enough that a test does not sit through the cadence the player watches at.
+const SOON: Duration = Duration::from_millis(50);
+
+/// Long enough for several passes at [`SOON`] to have gone by.
+const SEVERAL_PASSES: Duration = Duration::from_millis(300);
+
+/// A track built outside `dir` and moved in whole, the way a finished download arrives.
+///
+/// Building it in place would have the watch find it under the fixture's own name while it is still
+/// being written, which is not what is being tested here.
+fn track_moved_in(dir: &Path, staging: &Path, name: &str) -> PathBuf {
+    let source = common::write_tagged_wav(staging);
+    let path = dir.join(name);
+    std::fs::rename(&source, &path).expect("move fixture in");
+
+    path
+}
+
+/// What a watch reports, waiting until it has `wanted` of them or until time runs out.
+fn reported(watch: &mut autofill::Watch, wanted: usize) -> Vec<PathBuf> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut filled: Vec<PathBuf> = Vec::new();
+
+    while filled.len() < wanted && std::time::Instant::now() < deadline {
+        filled.extend(watch.collect());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    filled.sort();
+
+    filled
+}
+
 #[test]
-fn the_background_run_reports_each_file_it_fills() {
+fn the_background_watch_reports_each_file_it_fills() {
     let dir = common::scratch_dir("fill-background");
     std::fs::write(dir.join("cover.png"), common::png_gradient(32)).expect("write cover");
 
     let first = track_without_art(&dir, "one.wav");
     let second = track_without_art(&dir, "two.wav");
 
-    let filled = autofill::fill_in_background(vec![first.clone(), second.clone()], Settings::local_only());
+    let mut watch = autofill::watch(&dir, Settings::local_only());
 
-    let mut reported: Vec<PathBuf> = Vec::new();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-
-    while reported.len() < 2 && std::time::Instant::now() < deadline {
-        match filled.recv_timeout(std::time::Duration::from_millis(200)) {
-            Ok(path) => reported.push(path),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-    }
-
-    reported.sort();
-    assert_eq!(reported, [first.clone(), second.clone()]);
+    assert_eq!(reported(&mut watch, 2), [first.clone(), second.clone()]);
     assert!(has_art(&first) && has_art(&second));
+}
+
+#[test]
+fn a_file_that_appears_while_watching_is_filled_in_too() {
+    let dir = common::scratch_dir("fill-watch-new");
+    let staging = common::scratch_dir("fill-watch-new-staging");
+    std::fs::write(dir.join("cover.png"), common::png_gradient(32)).expect("write cover");
+
+    let first = track_without_art(&dir, "one.wav");
+
+    let mut watch = autofill::watch_every(&dir, Settings::local_only(), SOON);
+
+    assert_eq!(reported(&mut watch, 1), [first], "the first pass covers what was already there");
+
+    // Dropped in while the watch is running, as a download that has just finished would be.
+    let later = track_moved_in(&dir, &staging, "two.wav");
+
+    assert_eq!(reported(&mut watch, 1), std::slice::from_ref(&later), "and a later pass picks the new file up");
+    assert!(has_art(&later));
+}
+
+#[test]
+fn a_file_the_watch_has_settled_is_not_looked_at_again() {
+    let dir = common::scratch_dir("fill-watch-settled");
+    let track = track_without_art(&dir, "track.wav");
+
+    let mut watch = autofill::watch_every(&dir, Settings::local_only(), SOON);
+
+    // Nothing in the folder supplies art, so there is nothing to write — this pass and every one
+    // after it.
+    std::thread::sleep(SEVERAL_PASSES);
+
+    assert_eq!(watch.collect(), Vec::<PathBuf>::new(), "nothing was filled in");
+    assert!(!has_art(&track));
+
+    let before = std::fs::metadata(&track).expect("read metadata").modified().expect("mtime");
+    std::thread::sleep(SEVERAL_PASSES);
+    let after = std::fs::metadata(&track).expect("read metadata").modified().expect("mtime");
+
+    assert_eq!(before, after, "and the file is left exactly as it was");
+}
+
+#[test]
+fn dropping_the_watch_stops_it() {
+    let dir = common::scratch_dir("fill-watch-dropped");
+    let staging = common::scratch_dir("fill-watch-dropped-staging");
+    std::fs::write(dir.join("cover.png"), common::png_gradient(32)).expect("write cover");
+
+    let first = track_without_art(&dir, "one.wav");
+    let mut watch = autofill::watch_every(&dir, Settings::local_only(), SOON);
+
+    assert_eq!(reported(&mut watch, 1), [first]);
+
+    drop(watch);
+
+    // A file that arrives after the watch is gone is nobody's business.
+    let later = track_moved_in(&dir, &staging, "two.wav");
+    std::thread::sleep(SEVERAL_PASSES);
+
+    assert!(!has_art(&later), "no thread is left looking at the folder");
 }
 
 #[test]

@@ -10,6 +10,12 @@
 //! ([`Release`]); a track that does not say borrows nothing. Guessing from the folder is how one
 //! song's cover ends up on a dozen unrelated ones.
 //!
+//! The filling runs in the background and keeps running: [`watch`] walks the library as soon as it
+//! is opened and again every [`RESCAN_INTERVAL`], so a track that arrives afterwards — a download
+//! finishing, an album copied in — is filled in without the player having to be reopened. Each file
+//! is dealt with once; only one that could not be read is tried again, since that usually means it
+//! was still arriving.
+//!
 //! **This writes to the user's music files**, so it only ever runs when
 //! [`Config::auto_fill_metadata`](crate::config::Config::auto_fill_metadata) is on, and it only ever
 //! adds a picture to a file that has none. An existing picture is never replaced.
@@ -21,9 +27,10 @@
 
 pub mod online;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::time::Duration;
 
 use lofty::config::WriteOptions;
 use lofty::file::{AudioFile, TaggedFileExt};
@@ -32,6 +39,7 @@ use lofty::probe::Probe;
 use lofty::tag::{ItemKey, Tag, TagType};
 
 use crate::genre;
+use crate::library;
 use crate::meta;
 
 /// What the filling is allowed to do.
@@ -238,31 +246,161 @@ where
     report
 }
 
-/// Fill in the background, reporting each file that gained a cover.
+/// How often the library is walked again, looking for files that were not there before.
 ///
-/// Reading and writing a whole library takes long enough that doing it on the interface's thread
-/// would freeze the display, so it happens on its own thread and results arrive as they come. The
-/// receiver simply ends when the work is done, or when it is dropped.
-pub fn fill_in_background(paths: Vec<PathBuf>, settings: Settings) -> Receiver<PathBuf> {
-    let (sender, receiver) = mpsc::channel();
+/// A pass over a library nothing has been added to costs a directory walk and no file reads at all,
+/// so this is soon enough to catch a download a moment after it lands and rare enough to leave the
+/// disk alone.
+const RESCAN_INTERVAL: Duration = Duration::from_secs(20);
 
-    // A failed spawn is not worth reporting: the worst case is that no covers get filled in.
+/// A fill running in the background, and the files it has finished with.
+///
+/// It keeps watching rather than ending with its first pass: tracks arrive in a library after the
+/// player has opened — a download finishes, a folder is copied in — and a cover that shows up only
+/// once the user next restarts the player looks like a cover that is missing.
+///
+/// Dropping this stops the watching. The thread notices between files, so a pass already under way
+/// stops at the next one rather than finishing the library.
+#[derive(Debug)]
+pub struct Watch {
+    /// The folder being watched, so a watch of somewhere else can be told from this one.
+    root: PathBuf,
+    /// What the watching is allowed to do, for the same reason.
+    settings: Settings,
+    /// Files that gained a cover or a genre, as they are written.
+    filled: Receiver<PathBuf>,
+    /// Held only to be dropped: the thread waits on the other end, so losing this is how it is
+    /// told to stop.
+    _leash: Sender<()>,
+    /// Set once the thread is gone, which happens only if it could not be started.
+    ended: bool,
+}
+
+impl Watch {
+    /// Files filled in since this was last asked, in the order they were written.
+    ///
+    /// Nothing needs reloading on their account — a [`Song`](crate::song::Song) reads the file again
+    /// when it is refreshed — so a caller with nothing to display may drop the list.
+    pub fn collect(&mut self) -> Vec<PathBuf> {
+        let mut filled = Vec::new();
+
+        loop {
+            match self.filled.try_recv() {
+                Ok(path) => filled.push(path),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.ended = true;
+                    break;
+                }
+            }
+        }
+
+        filled
+    }
+
+    /// Whether the watching has stopped, which means it will report nothing more.
+    pub fn ended(&self) -> bool {
+        self.ended
+    }
+
+    /// The folder being watched.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// What the watching is allowed to do.
+    pub fn settings(&self) -> Settings {
+        self.settings
+    }
+}
+
+/// Fill in what is missing under `root`, and keep doing it as files appear.
+///
+/// The first pass starts at once, so opening a library is what checks it over; every
+/// [`RESCAN_INTERVAL`] after that the folder is walked again and whatever is new is filled in.
+/// Reading and writing a whole library takes long enough that doing it on the interface's thread
+/// would freeze the display, so it happens on a thread of its own and results arrive as they come.
+pub fn watch(root: impl Into<PathBuf>, settings: Settings) -> Watch {
+    watch_every(root, settings, RESCAN_INTERVAL)
+}
+
+/// [`watch`], looking again every `interval` rather than at the usual cadence.
+pub fn watch_every(root: impl Into<PathBuf>, settings: Settings, interval: Duration) -> Watch {
+    let root = root.into();
+    let (sender, filled) = mpsc::channel();
+    let (leash, held) = mpsc::channel();
+
+    let walked = root.clone();
+
+    // A failed spawn is not worth reporting: the worst case is that no covers get filled in. The
+    // watch then says it has ended, the sender having gone with the closure.
     let _ = std::thread::Builder::new()
         .name("ogma-autofill".to_string())
         .spawn(move || {
-            let mut covers = CoverCache::default();
+            // What has been dealt with already, so each pass only costs what the library gained.
+            let mut handled: HashSet<PathBuf> = HashSet::new();
 
-            for path in paths {
-                if let Outcome::Filled { .. } = fill_with(&path, &mut covers, settings) {
-                    // A closed channel means the application has moved on.
-                    if sender.send(path).is_err() {
-                        return;
-                    }
+            loop {
+                if !pass(&walked, settings, &mut handled, &sender, &held) {
+                    return;
+                }
+
+                // Waiting on the leash is both the pause between passes and how the end of the
+                // watch is noticed, so a dropped `Watch` is not slept through.
+                if let Err(RecvTimeoutError::Disconnected) = held.recv_timeout(interval) {
+                    return;
                 }
             }
         });
 
-    receiver
+    Watch { root, settings, filled, _leash: leash, ended: false }
+}
+
+/// One walk of `root`, filling in every file not in `handled`.
+///
+/// Returns whether the watching should go on: a dropped [`Watch`] ends it, and so does a receiver
+/// nobody is reading any more.
+///
+/// The covers found are remembered for the pass and no longer. Keeping them would spare a long-
+/// lived watch some work, but a folder that had no art when it was first looked at is exactly the
+/// folder a `cover.jpg` is about to be dropped into, and a remembered miss would hide it.
+fn pass(
+    root: &Path,
+    settings: Settings,
+    handled: &mut HashSet<PathBuf>,
+    filled: &Sender<PathBuf>,
+    leash: &Receiver<()>,
+) -> bool {
+    let mut covers = CoverCache::default();
+
+    for path in library::paths(root) {
+        if let Err(TryRecvError::Disconnected) = leash.try_recv() {
+            return false;
+        }
+
+        if handled.contains(&path) {
+            continue;
+        }
+
+        let outcome = fill_with(&path, &mut covers, settings);
+
+        // A file that could not be read is left for the next pass: the usual reason is that it is
+        // still arriving — a download part-written, a copy in progress — and that fixes itself.
+        // Everything else is settled, and asking again every twenty seconds for the rest of the
+        // session would mean reading the whole library over and over.
+        if !matches!(outcome, Outcome::Failed(_)) {
+            handled.insert(path.clone());
+        }
+
+        if let Outcome::Filled { .. } = outcome
+            && filled.send(path).is_err()
+        {
+            // Nobody is listening any more, which means the application has moved on.
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Covers already found, so an album is searched once rather than once per track.

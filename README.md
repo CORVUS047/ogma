@@ -288,7 +288,7 @@ What this fetches is between you and the rights holder — yt-dlp is the same to
 | --- | --- |
 | Master volume | Fader applied to everything, shown as a percentage and in dB. Left / right adjust, `0`-`9` set the level |
 | Default folder | The folder the library is built from. `enter` types a path, `d` clears it |
-| Fill metadata | Writes missing artwork and genres into your music files. **Off by default — it modifies your files** |
+| Fill metadata | Writes missing artwork and genres into your music files. Runs when the library opens and keeps watching it, so tracks added later are filled in too. **Off by default — it modifies your files** |
 | Look online | Lets the artwork filling ask MusicBrainz and iTunes instead of only reading the disk. Off by default, and separate from the above on purpose. Needs Fill metadata on |
 | Genre lookup | Fills in a missing genre from MusicBrainz or iTunes. Its own switch, off by default. **Only ever fills a blank** — a genre already in the file, or typed in with `e`, is never replaced. Needs Fill metadata on |
 | Control hints | Whether the keys are listed on each screen. On by default, and applies as soon as the config is left — the player waiting behind Continue included |
@@ -300,7 +300,14 @@ What this fetches is between you and the rights holder — yt-dlp is the same to
 | Theme | Colours from `theme.toml` instead of the terminal's palette. Restart to apply |
 
 `s` saves. `q` or esc leaves; unsaved edits are still live for the session, but only the file survives
-a restart.
+a restart. The fill switches take effect as soon as the config is left, on the library already open.
+
+When the filling happens: every time the player opens a library — on start with a default folder set,
+or when you pick a folder — and every twenty seconds after that, for files that were not there
+before. A download that has just finished, or an album copied in while the player is running, is
+filled in where it lands; nothing is read twice, so a library that has not changed costs a folder
+walk. A file that could not be read is tried again on the next pass, which is what makes a part-
+written download sort itself out.
 
 Where a filled-in genre comes from: the genres MusicBrainz's users have voted for on the release, or
 on the release group it belongs to, and failing that the one genre iTunes files the album under.
