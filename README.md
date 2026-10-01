@@ -289,7 +289,7 @@ What this fetches is between you and the rights holder — yt-dlp is the same to
 | Master volume | Fader applied to everything, shown as a percentage and in dB. Left / right adjust, `0`-`9` set the level |
 | Default folder | The folder the library is built from. `enter` types a path, `d` clears it |
 | Fill metadata | Writes missing artwork and genres into your music files. Runs when the library opens and keeps watching it, so tracks added later are filled in too. **Off by default — it modifies your files** |
-| Look online | Lets the artwork filling ask MusicBrainz and iTunes instead of only reading the disk. Off by default, and separate from the above on purpose. Needs Fill metadata on |
+| Look online | Lets the artwork filling ask MusicBrainz, iTunes and — as a last resort — YouTube for a video thumbnail, instead of only reading the disk. Off by default, and separate from the above on purpose. Needs Fill metadata on |
 | Genre lookup | Fills in a missing genre from MusicBrainz or iTunes. Its own switch, off by default. **Only ever fills a blank** — a genre already in the file, or typed in with `e`, is never replaced. Needs Fill metadata on |
 | Control hints | Whether the keys are listed on each screen. On by default, and applies as soon as the config is left — the player waiting behind Continue included |
 | Hide messages | Silences what an action reports. The failures share that line, so turning it on hides those too. Applies straight away, like the hints |
@@ -301,6 +301,13 @@ What this fetches is between you and the rights holder — yt-dlp is the same to
 
 `s` saves. `q` or esc leaves; unsaved edits are still live for the session, but only the file survives
 a restart. The fill switches take effect as soon as the config is left, on the library already open.
+
+Two interfaces open on one library take turns: a file is claimed for as long as it is being written
+to, and whoever finds it claimed leaves it for later rather than rewriting it at the same moment — a
+rewrite is the whole file, so two at once is how a track gets truncated. The claims are files in
+`$XDG_RUNTIME_DIR/ogma-claims`, cleared on reboot, and one left behind by a player that was killed
+mid-write is taken over after five minutes. A genre typed in with `e` waits its turn the same way,
+and says so on the message row if the file never comes free.
 
 When the filling happens: every time the player opens a library — on start with a default folder set,
 or when you pick a folder — and every twenty seconds after that, for files that were not there
@@ -318,7 +325,11 @@ genres share one pass per release, so turning both on does not double the reques
 Where filled-in artwork comes from, in order: an image beside the music under a conventional name
 (`cover.jpg`, `folder.png`, …), then a picture already embedded in another track **of the same
 release** in that folder, then — with Look online on — the Cover Art Archive or iTunes for the album
-the tags name. A file that already has a picture is never touched, and a file whose tags do not say
+the tags name, and failing all of those a YouTube video's thumbnail. The thumbnail is a last resort
+and looks like one: it is a frame from whatever somebody uploaded, in a video's shape rather than
+square, and it is taken only from a result whose title or channel names both the artist and the
+album, since a frame from the wrong video is worse than no picture. It needs `yt-dlp`, the same
+helper the YouTube mode uses; without it that step finds nothing. A file that already has a picture is never touched, and a file whose tags do not say
 which album it is from borrows nothing from its neighbours: in a folder holding several releases, as
 a downloads folder does, there is no way to tell whose cover is whose, and the wrong cover is worse
 than none. The one folder-wide source is a conventionally named image, which is the folder's own

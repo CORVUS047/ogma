@@ -1,12 +1,15 @@
 //! Looking up cover art and genres on the internet.
 //!
-//! Three services, tried in order of how precisely they can answer:
+//! Four sources, tried in order of how precisely they can answer:
 //!
 //! 1. **Cover Art Archive**, when the file carries a MusicBrainz release id — an exact lookup, no
 //!    guessing involved.
 //! 2. **MusicBrainz** search to turn an artist and album into release ids, then the Cover Art
 //!    Archive again.
 //! 3. **iTunes Search**, which often has art for releases MusicBrainz does not cover.
+//! 4. **A YouTube video's thumbnail**, as a last resort — see [`youtube_thumbnail`]. Not a cover but
+//!    a frame from whatever somebody uploaded, so it is reached only when every source that files
+//!    album art properly has come back with nothing.
 //!
 //! Genres come from the same two searches: MusicBrainz publishes the genres its users have voted
 //! for on a release and on the release group it belongs to, and iTunes names one genre per album.
@@ -14,7 +17,8 @@
 //!
 //! None of them need an account or a key. What leaves this machine is the artist and album names
 //! from the file's own tags, or a MusicBrainz id — nothing else, and only when the user has turned
-//! this on.
+//! this on. The YouTube search goes out through yt-dlp, which is what this player already asks about
+//! YouTube; a machine without it simply finds nothing at that step.
 //!
 //! MusicBrainz asks callers for an identifying user agent and no more than one request a second;
 //! both are honoured below.
@@ -39,6 +43,12 @@ const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// How many MusicBrainz candidates to try art for before giving up on an album.
 const MAX_RELEASE_CANDIDATES: usize = 3;
+
+/// How many YouTube results are considered when falling back to a thumbnail.
+///
+/// The first few are where a search puts the album upload if there is one; past that the results are
+/// other people's playlists and live sets, whose thumbnails have nothing to do with the record.
+const MAX_YOUTUBE_RESULTS: usize = 3;
 
 /// Least search score a MusicBrainz release must have before it is believed.
 ///
@@ -182,7 +192,76 @@ pub(super) fn look_up(query: &Query, wanted: Wanted) -> Answer {
         }
     }
 
+    // Everything that files album art has been asked by now. A video thumbnail is what is left: a
+    // worse picture than a cover, and better than the blank square the player draws without one.
+    // Nothing here answers the genre question — YouTube has no such thing to give.
+    if wanted.artwork && answer.artwork.is_none() {
+        answer.artwork = youtube_thumbnail(artist, album);
+    }
+
     answer
+}
+
+/// The thumbnail of a YouTube video of this release, when one can be found.
+///
+/// The last thing tried, and the least trustworthy: a thumbnail is whatever frame or picture the
+/// uploader chose, in the shape a video is rather than square, and for a full-album upload it is
+/// usually the cover while for anything else it is usually not. So the result has to name both the
+/// artist and the album before its thumbnail is taken — a search for a record nobody has uploaded
+/// still comes back with a page of other things, and a frame from the wrong video is worse than
+/// leaving the file alone.
+///
+/// yt-dlp does the searching, being what this player already asks about YouTube. A machine without
+/// it finds nothing here, which is the same as a search that matched nothing.
+fn youtube_thumbnail(artist: &str, album: &str) -> Option<Found> {
+    if !crate::ytdl::available() {
+        return None;
+    }
+
+    // Counted like any other request: it is traffic leaving the machine, whoever carries it.
+    REQUESTS.fetch_add(1, Ordering::Relaxed);
+
+    let results = crate::ytdl::search(&format!("{artist} {album}"), MAX_YOUTUBE_RESULTS).ok()?;
+
+    let track = results
+        .iter()
+        .find(|track| mentions(&track.title, track.uploader.as_deref(), artist, album))?;
+
+    // The id is about to go into a URL, so only the shape YouTube's ids actually have is accepted.
+    if track.id.is_empty()
+        || !track.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+
+    // Thumbnails sit at fixed names, largest first. The big ones are not made for every video;
+    // `hqdefault` is always there.
+    for size in ["maxresdefault", "sddefault", "hqdefault"] {
+        let url = format!("https://i.ytimg.com/vi/{}/{size}.jpg", track.id);
+
+        if let Some(data) = fetch_image(&url) {
+            return Some(Found { data, source: format!("youtube.com ({})", track.id) });
+        }
+    }
+
+    None
+}
+
+/// Whether a YouTube result is about this release.
+///
+/// Titles are free text — `Artist - Album (Full Album) [HD]` — so the names have to be found inside
+/// one rather than matched against it, and the uploader counts as part of the text: a channel named
+/// for the artist is how an upload titled only `OK Computer` says whose it is.
+fn mentions(title: &str, uploader: Option<&str>, artist: &str, album: &str) -> bool {
+    let text = normalize_name(&format!("{title} {}", uploader.unwrap_or_default()));
+    let artist = normalize_name(artist);
+    let album = normalize_name(album);
+
+    if artist.is_empty() || album.is_empty() {
+        return false;
+    }
+
+    text.contains(&artist) && text.contains(&album)
 }
 
 /// The genre MusicBrainz holds for a release: the most voted for of the release's own, or of its
@@ -541,6 +620,23 @@ mod tests {
         assert!(Query { artist: Some("a".into()), album: Some("b".into()), ..Query::default() }
             .is_usable());
         assert!(Query { release_mbid: Some("id".into()), ..Query::default() }.is_usable());
+    }
+
+    #[test]
+    fn a_youtube_result_has_to_name_the_release() {
+        assert!(mentions("Radiohead - OK Computer (Full Album)", None, "Radiohead", "OK Computer"));
+
+        // The channel is part of what a result says it is: an upload titled with the album alone is
+        // named by whose channel it sits on.
+        assert!(mentions("OK Computer [full album]", Some("Radiohead"), "Radiohead", "OK Computer"));
+
+        // A thumbnail from any of these is a frame of something else.
+        assert!(!mentions("Radiohead - Kid A", None, "Radiohead", "OK Computer"));
+        assert!(!mentions("10 hours of rain sounds", Some("Sleep"), "Radiohead", "OK Computer"));
+
+        // Nothing to go on is not a match.
+        assert!(!mentions("Radiohead - OK Computer", None, "", "OK Computer"));
+        assert!(!mentions("", None, "Radiohead", "OK Computer"));
     }
 
     #[test]
