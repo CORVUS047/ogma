@@ -104,13 +104,15 @@ fn the_control_hints_row_toggles_and_shows_its_state() {
     let rows: Vec<&str> = frame.lines().collect();
 
     let online = rows.iter().position(|r| r.contains("Look online")).expect("online row");
+    let genres = rows.iter().position(|r| r.contains("Genre lookup")).expect("genres row");
     let hints = rows.iter().position(|r| r.contains("Control hints")).expect("hints row");
 
-    assert_eq!(hints, online + 1, "the fifth row");
+    assert_eq!(genres, online + 1, "the genre lookup sits with the other online switch");
+    assert_eq!(hints, genres + 1, "the sixth row");
     assert!(rows[hints].contains("shown"), "shown by default: {}", rows[hints]);
 
-    // Four downs to reach it, then toggle.
-    for _ in 0..4 {
+    // Five downs to reach it, then toggle.
+    for _ in 0..5 {
         press(&mut menu, &mut config, KeyCode::Down);
     }
     press(&mut menu, &mut config, KeyCode::Enter);
@@ -134,11 +136,11 @@ fn the_hide_messages_row_toggles_and_quietens_the_screen() {
     let hints = rows.iter().position(|r| r.contains("Control hints")).expect("hints row");
     let messages = rows.iter().position(|r| r.contains("Hide messages")).expect("messages row");
 
-    assert_eq!(messages, hints + 1, "the sixth row");
+    assert_eq!(messages, hints + 1, "the seventh row");
     assert!(rows[messages].contains("off"), "off by default: {}", rows[messages]);
 
-    // Five downs to reach it, then toggle.
-    for _ in 0..5 {
+    // Six downs to reach it, then toggle.
+    for _ in 0..6 {
         press(&mut menu, &mut config, KeyCode::Down);
     }
     press(&mut menu, &mut config, KeyCode::Enter);

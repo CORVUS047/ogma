@@ -187,7 +187,7 @@ fn where_the_application_starts_and_how_it_comes_back() {
     assert_eq!(app.screen(), ScreenKind::Config);
 
     // Down to Control hints, and off.
-    for _ in 0..4 {
+    for _ in 0..5 {
         press(&mut app, KeyCode::Down);
     }
     press(&mut app, KeyCode::Enter);
@@ -209,7 +209,7 @@ fn where_the_application_starts_and_how_it_comes_back() {
         press(&mut app, KeyCode::Down);
     }
     press(&mut app, KeyCode::Enter);
-    for _ in 0..4 {
+    for _ in 0..5 {
         press(&mut app, KeyCode::Down);
     }
     press(&mut app, KeyCode::Enter);

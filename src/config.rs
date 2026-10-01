@@ -88,7 +88,7 @@ pub struct Config {
     /// Whether to fill in metadata a file is missing, where it can be found on disk.
     ///
     /// Off by default: it writes to the user's music files, which is not something to do unasked.
-    /// Only artwork is filled in so far — see [`crate::autofill`].
+    /// Artwork and genres are what it fills in — see [`crate::autofill`].
     auto_fill_metadata: bool,
     /// Whether filling in metadata may ask the internet, rather than only looking on disk.
     ///
@@ -96,6 +96,13 @@ pub struct Config {
     /// already on the machine and sending an album title to a third party are different acts, and
     /// agreeing to one is not agreeing to the other. Only takes effect while filling is on.
     fetch_artwork_online: bool,
+    /// Whether filling in metadata may look a genre up online.
+    ///
+    /// Its own switch, like the artwork lookup and for the same reason: each service asked is a
+    /// separate act, and agreeing to one is not agreeing to the next. Off by default, and takes
+    /// effect only while filling is on. A genre already in the file is never replaced.
+    #[serde(default)]
+    fetch_genres_online: bool,
     /// Whether the interface lists the keys for what is on screen.
     ///
     /// On by default: someone who has learnt the keys can turn them off, but nobody should have to
@@ -200,6 +207,7 @@ impl Default for Config {
             default_folder: None,
             auto_fill_metadata: false,
             fetch_artwork_online: false,
+            fetch_genres_online: false,
             show_control_hints: true,
             hide_status_messages: false,
             daemon_on_close: DaemonOnClose::default(),
@@ -336,6 +344,24 @@ impl Config {
         self.fetch_artwork_online = !self.fetch_artwork_online;
 
         self.fetch_artwork_online
+    }
+
+    /// Whether filling in metadata may look a genre up online.
+    ///
+    /// Meaningful only while [`Config::auto_fill_metadata`] is on.
+    pub fn fetch_genres_online(&self) -> bool {
+        self.fetch_genres_online
+    }
+
+    pub fn set_fetch_genres_online(&mut self, enabled: bool) {
+        self.fetch_genres_online = enabled;
+    }
+
+    /// Turn the genre lookup on if it is off, and off if it is on.
+    pub fn toggle_fetch_genres_online(&mut self) -> bool {
+        self.fetch_genres_online = !self.fetch_genres_online;
+
+        self.fetch_genres_online
     }
 
     /// Whether the interface lists the keys for what is on screen.

@@ -169,19 +169,21 @@ fn sorting_is_stable_for_tracks_that_tie() {
 }
 
 #[test]
-fn removing_takes_the_track_the_listing_shows() {
-    let (_dir, songs) = library("playlist-remove");
-    let mut playlist = Playlist::with_songs("Remove", songs);
+fn removing_a_track_takes_it_wherever_it_sits() {
+    let (_dir, songs) = library("playlist-remove-song");
+    let mut playlist = Playlist::with_songs("Remove Song", songs.clone());
     playlist.set_sort(SortBy::Title);
 
-    // Index 0 of the sorted order is "Alpha", not the first track added.
-    let removed = playlist.remove(0).expect("a track");
+    // Named rather than counted, so the sort the listing is in does not come into it.
+    assert!(playlist.remove_song(&songs[2]), "Mike was in it");
+    assert_eq!(titles(&playlist), ["Alpha", "Kilo", "Zulu"]);
 
-    assert_eq!(removed.display_title(), "Alpha");
-    assert_eq!(titles(&playlist), ["Kilo", "Mike", "Zulu"]);
+    // The added order keeps its gap closed, which is what `manual` comes back to.
+    playlist.set_sort(SortBy::Manual);
+    assert_eq!(titles(&playlist), ["Zulu", "Alpha", "Kilo"]);
+
+    assert!(!playlist.remove_song(&songs[2]), "and is not in it twice");
     assert_eq!(playlist.len(), 3);
-
-    assert!(playlist.remove(99).is_none(), "out of range is not an error");
 }
 
 // ------------------------------------------------------------------------------------- on disk

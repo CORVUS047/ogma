@@ -27,6 +27,7 @@ enum Field {
     DefaultFolder,
     AutoFillMetadata,
     FetchArtworkOnline,
+    FetchGenresOnline,
     ShowControlHints,
     HideStatusMessages,
     DaemonOnClose,
@@ -37,11 +38,12 @@ enum Field {
 }
 
 impl Field {
-    const ALL: [Field; 11] = [
+    const ALL: [Field; 12] = [
         Self::MasterVolume,
         Self::DefaultFolder,
         Self::AutoFillMetadata,
         Self::FetchArtworkOnline,
+        Self::FetchGenresOnline,
         Self::ShowControlHints,
         Self::HideStatusMessages,
         Self::DaemonOnClose,
@@ -57,6 +59,7 @@ impl Field {
             Self::DefaultFolder => "Default folder",
             Self::AutoFillMetadata => "Fill metadata",
             Self::FetchArtworkOnline => "Look online",
+            Self::FetchGenresOnline => "Genre lookup",
             Self::ShowControlHints => "Control hints",
             Self::HideStatusMessages => "Hide messages",
             Self::DaemonOnClose => "On close",
@@ -73,6 +76,7 @@ impl Field {
             Self::DefaultFolder => "enter edit path · d clear",
             Self::AutoFillMetadata => "enter toggle · writes missing artwork into files",
             Self::FetchArtworkOnline => "enter toggle · sends artist and album to services",
+            Self::FetchGenresOnline => "enter toggle · fills a missing genre, never replaces one",
             Self::ShowControlHints => "enter toggle · lists the keys on each screen",
             Self::HideStatusMessages => "enter toggle · silences what an action reports",
             Self::DaemonOnClose => "enter cycles · what happens to playback when closed",
@@ -278,6 +282,19 @@ impl ConfigMenu {
                     "Online lookup on: MusicBrainz, Cover Art Archive, iTunes"
                 } else {
                     "Online lookup off: disk only"
+                });
+            }
+
+            KeyCode::Enter | KeyCode::Char(' ')
+                if self.selected() == Field::FetchGenresOnline =>
+            {
+                let enabled = config.toggle_fetch_genres_online();
+                self.unsaved = true;
+
+                self.ok(if enabled {
+                    "Genre lookup on: fills a genre only where there is none"
+                } else {
+                    "Genre lookup off"
                 });
             }
 
@@ -553,7 +570,7 @@ impl ConfigMenu {
                 if config.auto_fill_metadata() {
                     vec![
                         Span::from("on").style(self.theme.success()),
-                        Span::from("   missing artwork").style(self.theme.muted()),
+                        Span::from("   missing artwork and genres").style(self.theme.muted()),
                     ]
                 } else {
                     vec![Span::from("off").style(self.theme.muted())]
@@ -579,6 +596,25 @@ impl ConfigMenu {
                         Span::from("off").style(self.theme.muted()),
                         Span::from("   disk only").style(self.theme.muted()),
                     ]
+                }
+            }
+            Field::FetchGenresOnline => {
+                // Like the artwork lookup: only meaningful while filling is on, and the row says so
+                // rather than lying about what it will do.
+                if !config.auto_fill_metadata() {
+                    let state = if config.fetch_genres_online() { "on" } else { "off" };
+
+                    vec![
+                        Span::from(state).style(self.theme.muted()),
+                        Span::from("   needs Fill metadata").style(self.theme.muted()),
+                    ]
+                } else if config.fetch_genres_online() {
+                    vec![
+                        Span::from("on").style(self.theme.success()),
+                        Span::from("   fills blanks only").style(self.theme.muted()),
+                    ]
+                } else {
+                    vec![Span::from("off").style(self.theme.muted())]
                 }
             }
             Field::ShowControlHints => {

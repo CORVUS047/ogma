@@ -440,6 +440,17 @@ fn the_player_carries_out_every_command_and_says_what_came_of_it() {
         "error: no song matching \"zzzz\""
     );
 
+    // --- emptying the queue, which is not stopping ---
+    daemon.apply(Command::LoadPlaylist("Late Night".to_string()));
+    daemon.apply(Command::Play);
+    assert!(!daemon.player().queue().is_empty(), "something to clear");
+
+    let playing = daemon.player().current().cloned();
+    assert_eq!(daemon.apply(Command::QueueClear), "ok: queue cleared");
+    assert!(daemon.player().queue().is_empty());
+    assert_eq!(daemon.player().current().cloned(), playing, "what is playing is not in the queue");
+    assert!(daemon.player().is_playing(), "and it plays on");
+
     // --- and finishing is a command like any other ---
     assert!(daemon.is_running());
     assert_eq!(daemon.apply(Command::Quit), "ok: finishing");

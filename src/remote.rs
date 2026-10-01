@@ -299,6 +299,11 @@ impl Controls for Remote {
         self.send(Command::QueueRemove(index));
     }
 
+    fn clear_queue(&mut self) {
+        Controls::clear_queue(&mut self.mirror);
+        self.send(Command::QueueClear);
+    }
+
     fn play_now(&mut self, song: Song) {
         let command = match StreamTrack::of(&song) {
             Some(track) => Command::PlayStream(track),

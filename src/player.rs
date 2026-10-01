@@ -41,6 +41,8 @@ pub trait Controls {
     fn add_queue(&mut self, song: Song);
     fn add_queue_all(&mut self, songs: Vec<Song>);
     fn remove_queue(&mut self, index: usize);
+    /// Empty the queue and the history, leaving a song that is playing alone.
+    fn clear_queue(&mut self);
     fn play_now(&mut self, song: Song);
     /// Start the queue entry at `index`, sending what was playing to the history.
     fn play_queued(&mut self, index: usize);
@@ -110,6 +112,10 @@ impl Controls for Player {
 
     fn remove_queue(&mut self, index: usize) {
         Player::remove_queue(self, index);
+    }
+
+    fn clear_queue(&mut self) {
+        Player::clear_queue(self);
     }
 
     fn play_now(&mut self, song: Song) {
@@ -438,9 +444,20 @@ impl Player {
         (index < self.queue.len()).then(|| self.queue.remove(index))
     }
 
-    /// Empty the queue, leaving the current song alone.
+    /// Empty the queue and forget what has played.
+    ///
+    /// A song that is playing is left alone — clearing what comes next should not cut it off. With
+    /// playback stopped or paused there is nothing to interrupt, so the current song goes too and
+    /// the player is left empty.
     pub fn clear_queue(&mut self) {
         self.queue.clear();
+        self.previous.clear();
+
+        if self.state != PlaybackState::Playing {
+            self.current = None;
+            self.position = Duration::ZERO;
+            self.state = PlaybackState::Stopped;
+        }
     }
 
     /// Forget what has played.

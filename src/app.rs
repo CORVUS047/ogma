@@ -454,8 +454,12 @@ impl App {
                 .iter()
                 .map(|song| song.path().to_path_buf())
                 .collect();
-            // Asking the internet is its own switch, so the two consents stay separate.
-            let settings = autofill::Settings { online: self.config.fetch_artwork_online() };
+            // Each thing the filling may ask the internet for is its own switch, so the consents
+            // stay separate: covers and genres are turned on one at a time.
+            let settings = autofill::Settings {
+                online: self.config.fetch_artwork_online(),
+                genres: self.config.fetch_genres_online(),
+            };
 
             self.fills = Some(autofill::fill_in_background(paths, settings));
         }

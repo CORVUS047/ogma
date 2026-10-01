@@ -26,6 +26,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, List, ListItem, ListState, Padding};
 
 use crate::browse::{self, Facet};
+use crate::genre;
 use crate::library;
 use crate::meta;
 use crate::player::Controls;
@@ -111,6 +112,13 @@ pub struct FilePane {
     searching: bool,
     /// What has been typed into the YouTube query, while it is being typed.
     typing_query: Option<String>,
+    /// What has been typed into the genre prompt, while it is being typed.
+    typing_genre: Option<String>,
+    /// How many tracks the genre being typed will be written to, so the prompt can say so before it
+    /// is answered rather than after.
+    genre_targets: usize,
+    /// A genre being written in the background, and what it is, so the report can name it.
+    tagging: Option<(String, Receiver<genre::Report>)>,
     /// The query the results on screen came from.
     query: String,
     /// What the last YouTube search turned up, as songs that play from the network.
@@ -178,6 +186,9 @@ impl FilePane {
             visible: Vec::new(),
             searching: false,
             typing_query: None,
+            typing_genre: None,
+            genre_targets: 0,
+            tagging: None,
             query: String::new(),
             results: Vec::new(),
             asking: None,
@@ -244,6 +255,7 @@ impl FilePane {
         self.collect_index();
         self.collect_search();
         self.collect_download();
+        self.collect_tagging();
     }
 
     /// Whether what was drawn last should be cleared rather than drawn over, taking the flag.
@@ -317,14 +329,8 @@ impl FilePane {
             .map(Entry::File)
             .collect();
 
-        let detail = format!(
-            "{} · {}{}",
-            playlist.len(),
-            playlist.sort().label(),
-            if playlist.descending() { " ↓" } else { "" }
-        );
-
-        self.mode = Mode::Playlist { name: playlist.name().to_string(), detail };
+        self.mode =
+            Mode::Playlist { name: playlist.name().to_string(), detail: detail_of(playlist) };
         self.filter = None;
         self.searching = false;
         self.typing_query = None;
@@ -336,6 +342,25 @@ impl FilePane {
         } else {
             None
         };
+    }
+
+    /// Show `playlist` again after it has changed, leaving the cursor where it was.
+    ///
+    /// Opening a playlist starts at the top, which is right for opening one and wrong for taking a
+    /// track out of it: the next row should be under the cursor, not the first.
+    pub fn refresh_playlist(&mut self, playlist: &Playlist) {
+        if !matches!(self.mode, Mode::Playlist { .. }) {
+            return;
+        }
+
+        self.entries = playlist.ordered().into_iter().cloned().map(Entry::File).collect();
+        self.mode =
+            Mode::Playlist { name: playlist.name().to_string(), detail: detail_of(playlist) };
+
+        // A row has gone from the listing, so the row that was last is drawn over rather than left
+        // behind, and the cursor is clamped to what is left by the filter.
+        self.repaint = true;
+        self.apply_filter();
     }
 
     /// Go back to listing the folder.
@@ -353,7 +378,7 @@ impl FilePane {
     /// Whether keys are being typed — into the filter, or into a YouTube query — in which case the
     /// screen must not treat them as commands.
     pub fn is_typing(&self) -> bool {
-        self.searching || self.typing_query.is_some()
+        self.searching || self.typing_query.is_some() || self.typing_genre.is_some()
     }
 
     /// What the search is narrowing the listing to, if anything.
@@ -476,6 +501,10 @@ impl FilePane {
             return self.handle_search_key(key);
         }
 
+        if self.typing_genre.is_some() {
+            return self.handle_genre_key(key);
+        }
+
         if self.typing_query.is_some() {
             return self.handle_query_key(key);
         }
@@ -539,6 +568,10 @@ impl FilePane {
             KeyCode::Char('t') if matches!(self.mode, Mode::Browse { .. }) => self.cycle_facet(),
             // Keep the chosen results rather than streaming them.
             KeyCode::Char('d') if self.mode == Mode::Youtube => self.download_chosen(),
+
+            // Type a genre onto what is highlighted: a track, or everything under a folder or
+            // group. What is there now is offered to be edited rather than retyped.
+            KeyCode::Char('e') => self.start_genre(),
 
             // Pick something up to move it, or put it down again.
             KeyCode::Char('x') => self.hold_highlighted(),
@@ -921,6 +954,148 @@ impl FilePane {
         }
     }
 
+    // ----------------------------------------------------------------------------------- genre
+
+    /// Open the genre prompt for whatever is highlighted.
+    ///
+    /// A track gives one file, a folder every track below it, a group its tracks: the same reading
+    /// of a row that `a` queues. What the first of them says is what the prompt starts with, so a
+    /// genre that is nearly right is corrected rather than typed again.
+    fn start_genre(&mut self) {
+        let songs = self.highlighted_songs();
+        let files: Vec<&Song> = songs.iter().filter(|song| !song.is_stream()).collect();
+
+        if files.is_empty() {
+            // A stream is not a file: there is nothing on disk to write a tag into.
+            self.status = Some(match songs.is_empty() {
+                true => "nothing to tag".to_string(),
+                false => "a stream has no file to tag".to_string(),
+            });
+
+            return;
+        }
+
+        self.genre_targets = files.len();
+        self.typing_genre = Some(files[0].genre().unwrap_or_default().to_string());
+    }
+
+    /// Keys while a genre is being typed.
+    fn handle_genre_key(&mut self, key: KeyEvent) -> bool {
+        let Some(genre) = &mut self.typing_genre else {
+            return false;
+        };
+
+        match key.code {
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => genre.clear(),
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => genre.push(c),
+            KeyCode::Backspace => {
+                genre.pop();
+            }
+            KeyCode::Enter => {
+                let genre = genre.clone();
+                self.write_genre(genre);
+            }
+            KeyCode::Esc => {
+                self.typing_genre = None;
+                self.status = Some("cancelled".to_string());
+            }
+            _ => {}
+        }
+
+        true
+    }
+
+    /// Write `genre` onto everything the prompt was opened for, on a thread of its own.
+    ///
+    /// Each file is rewritten where it sits, so a folder's worth of them takes long enough that
+    /// doing it here would stop the display. An empty genre is a cancellation rather than an order
+    /// to clear one: the two cannot be told apart at the prompt, and the destructive reading is the
+    /// wrong one to guess at.
+    fn write_genre(&mut self, genre: String) {
+        self.typing_genre = None;
+
+        let genre = genre.trim().to_string();
+
+        if genre.is_empty() {
+            self.status = Some("no genre typed".to_string());
+            return;
+        }
+
+        if self.tagging.is_some() {
+            self.status = Some("still tagging — one moment".to_string());
+            return;
+        }
+
+        let paths: Vec<PathBuf> = self
+            .highlighted_songs()
+            .iter()
+            .filter(|song| !song.is_stream())
+            .map(|song| song.path().to_path_buf())
+            .collect();
+
+        if paths.is_empty() {
+            self.status = Some("nothing to tag".to_string());
+            return;
+        }
+
+        self.status = Some(match paths.len() {
+            1 => format!("tagging as {genre}…"),
+            count => format!("tagging {count} as {genre}…"),
+        });
+
+        self.tagging = Some((genre.clone(), genre::set_in_background(paths, genre)));
+    }
+
+    /// Take in what a genre run came to, and show the listing what it now says.
+    fn collect_tagging(&mut self) {
+        let Some((genre, tagging)) = &self.tagging else {
+            return;
+        };
+
+        match tagging.try_recv() {
+            Ok(report) => {
+                self.status = Some(report.summary(genre));
+                self.tagging = None;
+
+                // The rows read their tags from the files, which have just changed under them.
+                self.reload_tags();
+            }
+            Err(TryRecvError::Empty) => {}
+            // The thread went away without answering, which is the spawn having failed.
+            Err(TryRecvError::Disconnected) => {
+                self.tagging = None;
+                self.status = Some("the tagging could not be started".to_string());
+            }
+        }
+    }
+
+    /// Point the listing at the files again, so tags written since it was built are read afresh.
+    ///
+    /// A [`Song`] remembers what it read the first time it was asked, which is what keeps a listing
+    /// from re-reading every file on every frame; after a write that memory is what is wrong, so
+    /// the rows are replaced with songs that have not read anything yet. Streams are left as they
+    /// are: what they know came from the search, not from a file.
+    fn reload_tags(&mut self) {
+        fn reread(song: &Song) -> Song {
+            match song.is_stream() {
+                true => song.clone(),
+                false => Song::new(song.path()),
+            }
+        }
+
+        for entry in &mut self.entries {
+            match entry {
+                Entry::File(song) => *song = reread(song),
+                Entry::Group { songs, .. } => {
+                    *songs = songs.iter().map(reread).collect();
+                }
+                Entry::Parent(_) | Entry::Folder(_) => {}
+            }
+        }
+
+        self.indexed = self.indexed.iter().map(reread).collect();
+    }
+
     // --------------------------------------------------------------------------------- youtube
 
     /// Keys while the query is being typed.
@@ -1141,6 +1316,10 @@ impl FilePane {
     /// worse than no reminder, since the key it names is the part that goes. The number of lines
     /// varies with the mode, and the listing gives up a row for them.
     fn hint_lines(&self) -> &'static [&'static str] {
+        if self.typing_genre.is_some() {
+            return &["enter tag · esc cancel", "tab still changes pane"];
+        }
+
         if self.searching {
             return &["enter keep · esc cancel", "tab still changes pane"];
         }
@@ -1153,16 +1332,18 @@ impl FilePane {
             Mode::Folder => &[
                 "a queue · A all · P playlist",
                 "enter open · bksp up · / find",
-                "x hold · M move · m mode",
+                "x hold · M move · e genre",
+                "m mode",
             ],
             Mode::Playlist { .. } => &[
                 "a queue · A all · P playlist",
-                "/ find · bksp back · m mode",
+                "x remove · / find · bksp back",
+                "e genre · m mode",
             ],
             Mode::Browse { .. } => &[
                 "a queue · A all · P playlist",
                 "enter open · t by · bksp back",
-                "/ find · m mode",
+                "/ find · e genre · m mode",
             ],
             Mode::Youtube => &[
                 "enter play · a queue · A all",
@@ -1330,7 +1511,25 @@ impl FilePane {
 
         // The message row says what is going on: the query while it is being typed, what it narrowed
         // to once it has been, and otherwise whatever the last action did.
-        if self.searching {
+        if let Some(genre) = &self.typing_genre {
+            // The count is part of the prompt: typing a genre onto a folder touches every track
+            // under it, which is worth knowing before enter rather than after.
+            let label = match self.genre_targets {
+                1 => "genre: ".to_string(),
+                count => format!("genre ×{count}: "),
+            };
+            let room = width.saturating_sub(label.chars().count() + 1);
+
+            frame.render_widget(
+                Line::from(vec![
+                    Span::from(label).style(self.theme.text()),
+                    Span::from(truncate(genre, room))
+                        .style(self.theme.text().add_modifier(Modifier::UNDERLINED)),
+                    Span::from("█").style(self.theme.accent()),
+                ]),
+                status_area,
+            );
+        } else if self.searching {
             let query = self.filter.clone().unwrap_or_default();
 
             frame.render_widget(
@@ -1458,6 +1657,16 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+/// The line under the border while a playlist is listed: how many tracks, and its sort.
+fn detail_of(playlist: &Playlist) -> String {
+    format!(
+        "{} · {}{}",
+        playlist.len(),
+        playlist.sort().label(),
+        if playlist.descending() { " ↓" } else { "" }
+    )
 }
 
 /// The last component of a path, for display.

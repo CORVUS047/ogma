@@ -176,7 +176,7 @@ pub enum Command {
     QueueAddFolder(PathBuf),
     /// Take the queue entry at this position out.
     QueueRemove(usize),
-    /// Empty the queue, leaving what is playing alone.
+    /// Empty the queue and the history, leaving a song that is playing alone.
     QueueClear,
     /// Start this file now, sending whatever was playing to the history.
     PlayFile(PathBuf),
@@ -436,6 +436,7 @@ impl Command {
             ("queue_stream <url>", "add a track from the network to the queue"),
             ("volume <±points>", "move the volume, e.g. 10 or -5"),
             ("seek <±seconds>", "move the position, e.g. 30 or -10"),
+            ("queue_clear", "empty the queue and the history, leaving a playing song alone"),
             ("stop", "halt playback and rewind, keeping the queue"),
             ("clear", "stop and forget the queue and history"),
             ("status", "report what is playing, as JSON"),
@@ -819,6 +820,14 @@ mod tests {
             Command::parse("play_song Windowlicker").expect("a command"),
             Command::PlaySong("Windowlicker".to_string())
         );
+
+        // Emptying the queue is not stopping: `clear` forgets the history and what is playing too.
+        assert_eq!(Command::parse("queue_clear").expect("a command"), Command::QueueClear);
+        assert_eq!(Command::parse("queue-clear").expect("a command"), Command::QueueClear);
+        assert_eq!(Command::parse("clear").expect("a command"), Command::Clear);
+
+        // And it is listed, so `ogma-cmd` with no arguments names it.
+        assert!(Command::usage().iter().any(|(name, _)| *name == "queue_clear"));
     }
 
     #[test]
@@ -920,6 +929,7 @@ mod tests {
             Command::Leave { id: "4213-0".to_string(), on_leave: OnLeave::Stop },
             Command::Leave { id: "4213-1".to_string(), on_leave: OnLeave::StopIfSpawned },
             Command::Interfaces,
+            Command::QueueClear,
         ] {
             let line = command.to_line();
 

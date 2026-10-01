@@ -285,6 +285,36 @@ fn songs_can_be_added_to_the_selected_playlist() {
 }
 
 #[test]
+fn songs_can_be_taken_back_out_of_a_playlist() {
+    let directory = redirect();
+
+    let tracks = songs("pane-remove");
+    let playlist = Playlist::with_songs("Shrinking", tracks.clone());
+    playlist.save().expect("save");
+
+    let mut pane = PlaylistPane::with_playlists(vec![playlist]);
+
+    let updated = pane.remove_song("Shrinking", &tracks[0]).expect("removed");
+    assert_eq!(updated.len(), 2);
+    assert_eq!(pane.selected().expect("a playlist").len(), 2, "the pane holds the shorter list");
+    assert!(render(&mut pane, true).contains("removed Charlie"));
+
+    // Written as it goes, like adding.
+    let saved = Playlist::load_from(&directory.join("shrinking.toml")).expect("load");
+    assert_eq!(saved.len(), 2);
+    assert!(!saved.as_added().contains(&tracks[0]));
+
+    // A track that is not in it, and a playlist that does not exist, are both said so rather than
+    // quietly doing nothing.
+    assert!(pane.remove_song("Shrinking", &tracks[0]).is_err());
+    assert!(render_at(&mut pane, true, 40).contains("Charlie is not in Shrinking"));
+
+    assert!(pane.remove_song("Nowhere", &tracks[1]).is_err());
+    assert!(render_at(&mut pane, true, 40).contains("no playlist called Nowhere"));
+    assert_eq!(pane.selected().expect("a playlist").len(), 2, "and nothing else changed");
+}
+
+#[test]
 fn a_message_about_an_action_does_not_cover_the_keys() {
     redirect();
 
@@ -538,6 +568,93 @@ fn opening_a_playlist_lists_it_in_the_file_viewer() {
     assert!(!frame.contains("♪ Late Night"), "no longer the playlist: {frame}");
     assert!(frame.contains("screen-open-playlist"), "the folder is named: {frame}");
     assert!(frame.contains(".."), "and its way out is listed");
+}
+
+#[test]
+fn x_takes_the_highlighted_track_out_of_an_open_playlist() {
+    let directory = redirect();
+
+    let dir = common::scratch_dir("screen-remove-from-playlist");
+    let tracks: Vec<Song> = [("c.wav", "Zulu"), ("a.wav", "Alpha"), ("b.wav", "Kilo")]
+        .iter()
+        .map(|(name, title)| {
+            Song::new(common::write_wav(
+                &dir,
+                &WavSpec { name, title: Some(title), ..WavSpec::default() },
+            ))
+        })
+        .collect();
+
+    let mut playlist = Playlist::with_songs("Thinning", tracks.clone());
+    playlist.set_sort(SortBy::Title);
+    playlist.save().expect("save");
+
+    let mut player = Player::new();
+    let mut screen = PlayerScreen::with_playlists(&dir, vec![playlist]);
+
+    // Open the playlist in the file listing, which is where its tracks are rows.
+    screen.handle_key(KeyEvent::from(KeyCode::BackTab), &mut player);
+    screen.handle_key(KeyEvent::from(KeyCode::Char('o')), &mut player);
+
+    // The first row is "Alpha", the playlist being sorted by title.
+    screen.handle_key(KeyEvent::from(KeyCode::Char('x')), &mut player);
+
+    let saved = Playlist::load_from(&directory.join("thinning.toml")).expect("load");
+    assert_eq!(saved.len(), 2, "written as it goes");
+    assert!(!saved.as_added().contains(&tracks[1]), "Alpha is gone from the file");
+
+    let frame = screen_frame(&mut screen, &player);
+    // The rows of the listing itself: tracks are drawn indented, under the playlist's own line.
+    let listing: Vec<String> = frame
+        .lines()
+        .skip_while(|row| !row.contains(" Playlist "))
+        .map(|row| row.chars().take(33).collect::<String>())
+        .filter(|row| row.starts_with("│ ›   ") || row.starts_with("│     "))
+        .filter(|row| !row.trim_matches(['│', ' ', '›']).is_empty())
+        .collect();
+
+    assert_eq!(listing.len(), 2, "two tracks left: {frame}");
+    assert!(!listing.iter().any(|row| row.contains("Alpha")), "Alpha is gone: {frame}");
+    assert!(listing[0].contains("Kilo") && listing[1].contains("Zulu"), "the rest stay: {frame}");
+    assert!(frame.contains("removed Alpha"), "the pane says what it did: {frame}");
+    assert!(player.queue().is_empty(), "removing is not queuing");
+
+    // The cursor stayed on the row that is now first, so the next track can go with another press.
+    screen.handle_key(KeyEvent::from(KeyCode::Char('x')), &mut player);
+    assert_eq!(Playlist::load_from(&directory.join("thinning.toml")).expect("load").len(), 1);
+
+    // Delete does the same, and the last one out leaves an empty playlist rather than no playlist.
+    screen.handle_key(KeyEvent::from(KeyCode::Delete), &mut player);
+
+    let saved = Playlist::load_from(&directory.join("thinning.toml")).expect("load");
+    assert!(saved.is_empty(), "emptied, not deleted");
+    assert_eq!(screen.playlists().len(), 1, "the playlist itself is still there");
+
+    // Nothing left to take out.
+    screen.handle_key(KeyEvent::from(KeyCode::Char('x')), &mut player);
+    let frame = screen_frame(&mut screen, &player);
+    assert!(frame.contains("nothing to remove"), "{frame}");
+}
+
+#[test]
+fn x_in_a_folder_still_picks_a_file_up_to_move_it() {
+    redirect();
+
+    let dir = common::scratch_dir("screen-remove-not-a-playlist");
+    common::write_wav(
+        &dir,
+        &WavSpec { name: "only.wav", title: Some("Only"), ..WavSpec::default() },
+    );
+
+    let mut player = Player::new();
+    let mut screen = PlayerScreen::with_playlists(&dir, vec![Playlist::new("Untouched")]);
+
+    // Onto the track, then `x`: a folder listing holds files to move, not playlist rows to remove.
+    screen.handle_key(KeyEvent::from(KeyCode::Down), &mut player);
+    screen.handle_key(KeyEvent::from(KeyCode::Char('x')), &mut player);
+
+    let frame = screen_frame(&mut screen, &player);
+    assert!(frame.contains("holding only.wav"), "{frame}");
 }
 
 /// The whole player screen as text, for the cross-pane checks above.

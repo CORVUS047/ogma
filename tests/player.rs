@@ -224,6 +224,50 @@ fn stop_rewinds_but_keeps_the_queue() {
 }
 
 #[test]
+fn clearing_the_queue_forgets_the_history_but_keeps_a_playing_song() {
+    let mut player = Player::new();
+    player.add_queue_all([song("a"), song("b"), song("c")]);
+    player.play();
+    player.skip();
+
+    assert_eq!(player.history(), [song("a")]);
+    let playing = player.current().cloned().expect("something playing");
+
+    player.clear_queue();
+
+    assert!(player.queue().is_empty());
+    assert!(player.history().is_empty(), "the history goes with the queue");
+    assert_eq!(player.current(), Some(&playing), "the song that is playing plays on");
+    assert_eq!(player.state(), PlaybackState::Playing);
+}
+
+#[test]
+fn clearing_the_queue_while_not_playing_drops_the_current_song_too() {
+    for pause in [true, false] {
+        let mut player = Player::new();
+        player.add_queue_all([song("a"), song("b")]);
+        player.play();
+        player.skip();
+        player.set_position(Duration::from_secs(5));
+
+        // Nothing is being cut off either way: paused and stopped both leave the current song idle.
+        if pause {
+            player.pause();
+        } else {
+            player.stop();
+        }
+
+        player.clear_queue();
+
+        assert!(player.is_empty());
+        assert!(player.history().is_empty());
+        assert!(player.current().is_none());
+        assert_eq!(player.position(), Duration::ZERO);
+        assert_eq!(player.state(), PlaybackState::Stopped);
+    }
+}
+
+#[test]
 fn clear_forgets_everything() {
     let mut player = Player::new();
     player.add_queue(song("a"));

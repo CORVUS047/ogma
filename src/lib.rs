@@ -6,6 +6,7 @@ pub mod autofill;
 pub mod browse;
 pub mod config;
 pub mod daemon;
+pub mod genre;
 pub mod ipc;
 pub mod library;
 pub mod meta;

@@ -42,7 +42,7 @@ fn a_cover_beside_the_music_is_written_into_the_file() {
 
     let outcome = autofill::fill(&track, Settings::local_only());
 
-    assert_eq!(outcome, Outcome::Filled { from: dir.join("cover.png") });
+    assert_eq!(outcome, Outcome::artwork_from(dir.join("cover.png")));
     assert!(has_art(&track), "the picture is in the file, not just in memory");
 
     // The audio itself still reads back.
@@ -74,7 +74,7 @@ fn conventional_cover_names_are_recognised_in_order_of_preference() {
 
         assert_eq!(
             autofill::fill(&track, Settings::local_only()),
-            Outcome::Filled { from: dir.join(name) },
+            Outcome::artwork_from(dir.join(name)),
             "{name} should be recognised"
         );
     }
@@ -86,7 +86,10 @@ fn conventional_cover_names_are_recognised_in_order_of_preference() {
         std::fs::write(dir.join(name), common::png_gradient(32)).expect("write cover");
     }
 
-    assert_eq!(autofill::fill(&track, Settings::local_only()), Outcome::Filled { from: dir.join("cover.png") });
+    assert_eq!(
+        autofill::fill(&track, Settings::local_only()),
+        Outcome::artwork_from(dir.join("cover.png"))
+    );
 }
 
 #[test]
@@ -266,7 +269,7 @@ fn what_reaches_the_network_and_what_does_not() {
     let before = autofill::online::requests_made();
     assert_eq!(
         autofill::fill(&track, Settings::with_online()),
-        Outcome::Filled { from: dir.join("cover.png") }
+        Outcome::artwork_from(dir.join("cover.png"))
     );
     assert_eq!(
         autofill::online::requests_made(),
@@ -319,6 +322,66 @@ fn what_reaches_the_network_and_what_does_not() {
     assert!(spent <= 3, "three tracks of one album cost {spent} requests");
 }
 
+#[test]
+fn a_genre_already_in_the_file_is_never_replaced() {
+    let dir = common::scratch_dir("fill-genre-kept");
+
+    // The fixture carries a genre and no picture. With both lookups on, the picture is what is
+    // missing — the genre is not — so nothing is asked about the genre and nothing is written over.
+    let track = track_without_art(&dir, "track.wav");
+    assert_eq!(Song::new(&track).genre(), Some("Ambient"), "the fixture starts with one");
+
+    // Genres on, covers from the disk only, so any request at all could only be about the genre.
+    let genres_only = Settings { online: false, genres: true };
+    let before = autofill::online::requests_made();
+
+    autofill::fill(&track, genres_only);
+
+    assert_eq!(Song::new(&track).genre(), Some("Ambient"), "left exactly as it was");
+    assert_eq!(
+        autofill::online::requests_made(),
+        before,
+        "and nobody was asked about a genre that is already there"
+    );
+}
+
+#[test]
+fn a_genre_is_only_looked_for_when_its_own_switch_is_on() {
+    let dir = common::scratch_dir("fill-genre-switch");
+
+    // No genre and no album tags: a genre is wanted but there is nothing to look one up by, so the
+    // question never leaves the machine. What is being checked is which switch asks it at all.
+    let track = dir.join("track.wav");
+    std::fs::write(&track, minimal_wav()).expect("write bare wav");
+
+    assert_eq!(Song::new(&track).genre(), None);
+
+    let before = autofill::online::requests_made();
+
+    // Filling from the disk alone never looks a genre up, whatever the file is missing.
+    assert_eq!(autofill::fill(&track, Settings::local_only()), Outcome::NothingFound);
+
+    // And with the switch on, an unanswerable query is still asked of nobody.
+    let both = Settings { online: true, genres: true };
+    assert_eq!(autofill::fill(&track, both), Outcome::NothingFound);
+    assert_eq!(autofill::online::requests_made(), before, "an empty query asks nobody");
+
+    assert_eq!(Song::new(&track).genre(), None, "and nothing was written");
+}
+
+#[test]
+fn a_run_counts_covers_and_genres_apart() {
+    let dir = common::scratch_dir("fill-report-genres");
+    let track = track_without_art(&dir, "track.wav");
+    std::fs::write(dir.join("cover.png"), common::png_gradient(32)).expect("write cover");
+
+    let report = autofill::fill_all([&track], Settings::local_only());
+
+    assert_eq!(report.filled, 1, "the file gained something");
+    assert_eq!(report.artwork, 1, "a cover");
+    assert_eq!(report.genres, 0, "and no genre, the disk having none to give");
+}
+
 /// Set the album and artist on a file, so there is a release to look up.
 fn tag_release(path: &Path, artist: &str, album: &str) {
     use lofty::config::WriteOptions;
@@ -359,4 +422,113 @@ fn minimal_wav() -> Vec<u8> {
     wav.extend_from_slice(&samples);
 
     wav
+}
+
+#[test]
+fn art_is_not_borrowed_from_a_track_of_another_release() {
+    let dir = common::scratch_dir("fill-mixed-folder");
+
+    // Two releases in one folder, as a downloads folder or a library kept flat has. The bare
+    // track comes first: both fixtures are written as `tagged.wav`, so the renamed one has to
+    // exist before the next is written.
+    let bare = track_without_art(&dir, "caramella-girls.wav");
+    tag_release(&bare, "Caramella Girls", "Caramella Dance");
+
+    let Some(written) = common::wav_with_cover(&dir) else {
+        return;
+    };
+    let stranger = dir.join("a-someone-else.wav");
+    std::fs::rename(&written, &stranger).expect("rename fixture");
+    tag_release(&stranger, "Someone Else", "A Different Record");
+
+    // The stranger sorts first and is the only file in the folder carrying art, which is exactly
+    // the shape that used to hand its cover to everything else.
+    assert_eq!(autofill::fill(&bare, Settings::local_only()), Outcome::NothingFound);
+    assert!(!has_art(&bare), "another release's cover is not this track's");
+}
+
+#[test]
+fn art_is_borrowed_from_a_track_of_the_same_release() {
+    let dir = common::scratch_dir("fill-same-release");
+
+    let bare = track_without_art(&dir, "b-track-two.wav");
+    tag_release(&bare, "Caramella Girls", "Caramella Dance");
+
+    let Some(written) = common::wav_with_cover(&dir) else {
+        return;
+    };
+    let sibling = dir.join("a-track-one.wav");
+    std::fs::rename(&written, &sibling).expect("rename fixture");
+    tag_release(&sibling, "Caramella Girls", "Caramella Dance");
+
+    let outcome = autofill::fill(&bare, Settings::local_only());
+
+    assert_eq!(outcome, Outcome::artwork_from(sibling));
+    assert!(has_art(&bare), "one release still shares its cover");
+}
+
+#[test]
+fn a_track_that_does_not_say_which_album_it_is_from_borrows_nothing() {
+    let dir = common::scratch_dir("fill-no-album");
+
+    // No album tag means no way to tell what release the track belongs to, so a sibling's art is
+    // guesswork. A sidecar image is still taken: that is the folder's own cover, named as one.
+    let bare = track_without_art(&dir, "b-untagged.wav");
+    strip_album(&bare);
+
+    let Some(written) = common::wav_with_cover(&dir) else {
+        return;
+    };
+    let sibling = dir.join("a-tagged.wav");
+    std::fs::rename(&written, &sibling).expect("rename fixture");
+    tag_release(&sibling, "Someone Else", "A Record");
+
+    assert_eq!(autofill::fill(&bare, Settings::local_only()), Outcome::NothingFound);
+    assert!(!has_art(&bare));
+}
+
+#[test]
+fn each_release_in_a_folder_is_answered_for_itself() {
+    let dir = common::scratch_dir("fill-two-releases");
+
+    // Two bare tracks from different releases, and art for only one of them. A run over the lot
+    // must fill the one and leave the other, rather than answering the folder once for both.
+    let ours = track_without_art(&dir, "b-ours.wav");
+    tag_release(&ours, "Caramella Girls", "Caramella Dance");
+
+    let theirs = track_without_art(&dir, "c-theirs.wav");
+    tag_release(&theirs, "Someone Else", "A Different Record");
+
+    let Some(written) = common::wav_with_cover(&dir) else {
+        return;
+    };
+    let sibling = dir.join("a-ours-with-art.wav");
+    std::fs::rename(&written, &sibling).expect("rename fixture");
+    tag_release(&sibling, "Caramella Girls", "Caramella Dance");
+
+    let report = autofill::fill_all([&ours, &theirs], Settings::local_only());
+
+    assert_eq!(report.filled, 1, "only the release that had art");
+    assert_eq!(report.nothing_found, 1);
+    assert!(has_art(&ours));
+    assert!(!has_art(&theirs));
+}
+
+/// Remove the album tag, for a file that cannot say which release it is from.
+fn strip_album(path: &Path) {
+    use lofty::config::WriteOptions;
+    use lofty::file::{AudioFile, TaggedFileExt};
+    use lofty::prelude::{Accessor, ItemKey};
+
+    let mut tagged = lofty::read_from_path(path).expect("read file");
+    let types: Vec<_> = tagged.tags().iter().map(|tag| tag.tag_type()).collect();
+
+    for tag_type in types {
+        if let Some(tag) = tagged.tag_mut(tag_type) {
+            tag.remove_album();
+            tag.remove_key(ItemKey::AlbumTitle);
+        }
+    }
+
+    tagged.save_to_path(path, WriteOptions::default()).expect("save tags");
 }

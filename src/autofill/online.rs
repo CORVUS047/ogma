@@ -1,4 +1,4 @@
-//! Looking up cover art on the internet.
+//! Looking up cover art and genres on the internet.
 //!
 //! Three services, tried in order of how precisely they can answer:
 //!
@@ -7,6 +7,10 @@
 //! 2. **MusicBrainz** search to turn an artist and album into release ids, then the Cover Art
 //!    Archive again.
 //! 3. **iTunes Search**, which often has art for releases MusicBrainz does not cover.
+//!
+//! Genres come from the same two searches: MusicBrainz publishes the genres its users have voted
+//! for on a release and on the release group it belongs to, and iTunes names one genre per album.
+//! Artwork and genres are separate switches, so one can be on while the other is off.
 //!
 //! None of them need an account or a key. What leaves this machine is the artist and album names
 //! from the file's own tags, or a MusicBrainz id — nothing else, and only when the user has turned
@@ -66,6 +70,51 @@ pub(super) struct Found {
     pub source: String,
 }
 
+/// What a lookup should go and find.
+///
+/// Artwork and genres are separate switches, and a file can be missing one without missing the
+/// other, so what is asked for is said rather than assumed: a release whose cover is already on
+/// disk costs no image fetch when only its genre is wanted.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct Wanted {
+    pub artwork: bool,
+    pub genre: bool,
+}
+
+impl Wanted {
+    /// Whether there is anything here to go and ask for.
+    pub(super) fn any(self) -> bool {
+        self.artwork || self.genre
+    }
+
+    /// What `self` wants that `other` already holds the answer to.
+    fn still_missing(self, answer: &Answer) -> Self {
+        Wanted {
+            artwork: self.artwork && answer.artwork.is_none(),
+            genre: self.genre && answer.genre.is_none(),
+        }
+    }
+}
+
+/// What a lookup found. Either half can be empty, whether or not it was asked for.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Answer {
+    pub artwork: Option<Found>,
+    pub genre: Option<String>,
+}
+
+impl Answer {
+    /// Take whatever `other` found that this does not already have.
+    pub(super) fn absorb(&mut self, other: Answer) {
+        if self.artwork.is_none() {
+            self.artwork = other.artwork;
+        }
+        if self.genre.is_none() {
+            self.genre = other.genre;
+        }
+    }
+}
+
 /// How many requests have been made, for tests and for anyone curious about the traffic.
 static REQUESTS: AtomicU64 = AtomicU64::new(0);
 
@@ -74,32 +123,127 @@ pub fn requests_made() -> u64 {
     REQUESTS.load(Ordering::Relaxed)
 }
 
-/// Look for cover art for `query`, or `None` when nothing turns up.
-pub(super) fn cover_for(query: &Query) -> Option<Found> {
-    if !query.is_usable() {
-        return None;
+/// Ask the services about `query`, for whichever of a cover and a genre `wanted` asks for.
+///
+/// One pass serves both: the MusicBrainz search that turns an artist and album into release ids is
+/// made once and its candidates answer either question, and the iTunes fallback reads art and
+/// genre out of a single search result. Asking for the two separately would double the traffic,
+/// and MusicBrainz is held to one request a second.
+pub(super) fn look_up(query: &Query, wanted: Wanted) -> Answer {
+    let mut answer = Answer::default();
+
+    if !wanted.any() || !query.is_usable() {
+        return answer;
     }
 
     // An exact id beats any search.
-    if let Some(mbid) = &query.release_mbid
-        && let Some(found) = cover_art_archive(mbid)
-    {
-        return Some(found);
+    if let Some(mbid) = &query.release_mbid {
+        if wanted.artwork {
+            answer.artwork = cover_art_archive(mbid);
+        }
+        if wanted.genre {
+            answer.genre = musicbrainz_genre(mbid);
+        }
     }
 
-    if let (Some(artist), Some(album)) = (&query.artist, &query.album) {
+    let (Some(artist), Some(album)) = (&query.artist, &query.album) else {
+        return answer;
+    };
+
+    let mut missing = wanted.still_missing(&answer);
+
+    if missing.any() {
         for mbid in musicbrainz_releases(artist, album) {
-            if let Some(found) = cover_art_archive(&mbid) {
-                return Some(found);
+            if missing.artwork {
+                answer.artwork = cover_art_archive(&mbid);
+            }
+            if missing.genre {
+                answer.genre = musicbrainz_genre(&mbid);
+            }
+
+            missing = wanted.still_missing(&answer);
+
+            if !missing.any() {
+                return answer;
             }
         }
+    }
 
-        if let Some(found) = itunes(artist, album) {
-            return Some(found);
+    // iTunes often has art for releases MusicBrainz does not cover, and files every album under a
+    // genre; one search answers both.
+    if missing.any()
+        && let Some(result) = itunes_album(artist, album)
+    {
+        if missing.artwork {
+            answer.artwork = itunes_artwork(&result);
+        }
+        if missing.genre {
+            answer.genre = itunes_genre(&result);
         }
     }
 
-    None
+    answer
+}
+
+/// The genre MusicBrainz holds for a release: the most voted for of the release's own, or of its
+/// release group's when the release itself has none.
+fn musicbrainz_genre(mbid: &str) -> Option<String> {
+    if !is_mbid(mbid) {
+        return None;
+    }
+
+    wait_for_musicbrainz();
+
+    let url =
+        format!("https://musicbrainz.org/ws/2/release/{mbid}?fmt=json&inc=genres+release-groups");
+    let body = fetch_json(&url)?;
+
+    best_genre(body.get("genres"))
+        .or_else(|| best_genre(body.get("release-group")?.get("genres")))
+}
+
+/// The most voted for of a list of MusicBrainz genres.
+///
+/// Ties are broken by name so that two runs over the same album agree; a genre nobody has voted for
+/// is still a genre, and counts as zero.
+fn best_genre(genres: Option<&Value>) -> Option<String> {
+    let mut best: Option<(u64, String)> = None;
+
+    for genre in genres?.as_array()? {
+        let Some(name) = genre.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let count = genre.get("count").and_then(Value::as_u64).unwrap_or(0);
+
+        let better = match &best {
+            None => true,
+            Some((best_count, best_name)) => {
+                count > *best_count || (count == *best_count && name < best_name.as_str())
+            }
+        };
+
+        if better {
+            best = Some((count, name.to_string()));
+        }
+    }
+
+    best.map(|(_, name)| title_case(&name))
+}
+
+/// MusicBrainz writes its genres in lowercase; a tag reads better with the words capitalised.
+fn title_case(genre: &str) -> String {
+    genre
+        .split(' ')
+        .map(|word| {
+            let mut chars = word.chars();
+
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The shared HTTP agent. One connection pool, one user agent, one timeout.
@@ -259,8 +403,11 @@ fn normalize_name(value: &str) -> String {
         .collect()
 }
 
-/// Album art from the iTunes Search API, which needs no key.
-fn itunes(artist: &str, album: &str) -> Option<Found> {
+/// The iTunes Search API's entry for an album, which needs no key.
+///
+/// Like MusicBrainz, iTunes answers a hopeless query with its closest guess, so the names it
+/// returns are checked here, once, before anything it says is believed.
+fn itunes_album(artist: &str, album: &str) -> Option<Value> {
     let term = percent_encode(&format!("{artist} {album}"));
     let url =
         format!("https://itunes.apple.com/search?media=music&entity=album&limit=1&term={term}");
@@ -268,8 +415,6 @@ fn itunes(artist: &str, album: &str) -> Option<Found> {
     let body = fetch_json(&url)?;
     let result = body.get("results")?.as_array()?.first()?;
 
-    // Like MusicBrainz, iTunes answers a hopeless query with its closest guess, so the names it
-    // returns are checked before its art is believed.
     let found_artist = result.get("artistName").and_then(Value::as_str).unwrap_or_default();
     let found_album = result.get("collectionName").and_then(Value::as_str).unwrap_or_default();
 
@@ -277,12 +422,29 @@ fn itunes(artist: &str, album: &str) -> Option<Found> {
         return None;
     }
 
+    Some(result.clone())
+}
+
+/// Album art from an iTunes search result.
+fn itunes_artwork(result: &Value) -> Option<Found> {
     let artwork = result.get("artworkUrl100")?.as_str()?;
 
     // The API returns a 100 pixel thumbnail; the same path serves larger renditions.
     let large = artwork.replace("100x100bb", "600x600bb");
 
     Some(Found { data: fetch_image(&large)?, source: "itunes.apple.com".to_string() })
+}
+
+/// The genre iTunes files an album under.
+fn itunes_genre(result: &Value) -> Option<String> {
+    let genre = result.get("primaryGenreName")?.as_str()?.trim();
+
+    // iTunes files everything it has no genre of its own for under `Music`, which says nothing.
+    if genre.is_empty() || genre.eq_ignore_ascii_case("music") {
+        return None;
+    }
+
+    Some(genre.to_string())
 }
 
 /// Hold off until a second has passed since the last MusicBrainz request.
@@ -424,8 +586,54 @@ mod tests {
     #[test]
     fn an_unusable_query_asks_nobody_anything() {
         let before = requests_made();
+        let everything = Wanted { artwork: true, genre: true };
 
-        assert!(cover_for(&Query::default()).is_none());
+        let answer = look_up(&Query::default(), everything);
+
+        assert!(answer.artwork.is_none());
+        assert!(answer.genre.is_none());
         assert_eq!(requests_made(), before, "no request should have been made");
+    }
+
+    #[test]
+    fn a_lookup_that_wants_nothing_asks_nothing() {
+        let before = requests_made();
+        let query = Query {
+            artist: Some("Radiohead".to_string()),
+            album: Some("OK Computer".to_string()),
+            release_mbid: None,
+        };
+
+        assert!(look_up(&query, Wanted::default()).artwork.is_none());
+        assert_eq!(requests_made(), before, "nothing wanted, so nobody asked");
+    }
+
+    #[test]
+    fn the_most_voted_for_genre_wins_and_ties_go_by_name() {
+        let genres = serde_json::json!([
+            { "name": "shoegaze", "count": 3 },
+            { "name": "dream pop", "count": 9 },
+            { "name": "noise rock", "count": 9 },
+        ]);
+
+        // Capitalised on the way out: MusicBrainz writes its genres in lowercase.
+        assert_eq!(best_genre(Some(&genres)), Some("Dream Pop".to_string()));
+
+        let unvoted = serde_json::json!([{ "name": "ambient" }]);
+        assert_eq!(best_genre(Some(&unvoted)), Some("Ambient".to_string()));
+
+        assert_eq!(best_genre(Some(&serde_json::json!([]))), None);
+        assert_eq!(best_genre(None), None);
+    }
+
+    #[test]
+    fn itunes_shelf_genres_that_say_nothing_are_refused() {
+        let result = serde_json::json!({ "primaryGenreName": "Dance" });
+        assert_eq!(itunes_genre(&result), Some("Dance".to_string()));
+
+        // What iTunes files an album under when it has nothing better to say.
+        assert_eq!(itunes_genre(&serde_json::json!({ "primaryGenreName": "Music" })), None);
+        assert_eq!(itunes_genre(&serde_json::json!({ "primaryGenreName": " " })), None);
+        assert_eq!(itunes_genre(&serde_json::json!({})), None);
     }
 }

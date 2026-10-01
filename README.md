@@ -166,7 +166,9 @@ disk or out of a search.
 | `a` | Queue the highlighted row — a track, a whole folder, or a whole group |
 | `A` | Queue everything listed |
 | `P` | Add the highlighted row to the selected playlist |
+| `e` | Type a genre onto the highlighted row: a track, or every track under a folder or group |
 | `x` | Pick the highlighted file or folder up to move it; again puts it back down |
+| `x` / delete | In playlist mode, take the highlighted track out of the playlist |
 | `M` | Move everything held into the folder being listed |
 | `/` | Find in the listing — in youtube mode, start a query; esc clears it |
 | `t` | In browse mode, change what the tracks are filed under |
@@ -183,6 +185,14 @@ In youtube mode, `/` starts a query and enter runs it; `d` downloads the highlig
 of streaming it. Arriving in the mode does not put the keyboard in a text field — the keys stay the
 panel's until `/` asks for one. See [YouTube](#youtube) below.
 
+Genres by hand: `e` opens a prompt holding whatever genre the row already carries, so one that is
+nearly right is corrected rather than retyped. Enter writes it — to the highlighted track, or to
+every track under a highlighted folder or group, which the prompt says the count of before you
+commit. A typed genre replaces what was there, in every tag the file carries: that is what typing it
+means. An empty prompt writes nothing rather than clearing the genre, since the two cannot be told
+apart at the prompt. The files are rewritten on a thread of its own, so a folder of them does not
+stop the display, and the pane says what it did when the run lands.
+
 Moving files: `x` marks a row — the margin shows `✂` — then walk wherever you like and press `M` to
 move everything held into the folder on screen. Folders move whole, several things can be held at
 once, and holding survives walking about: that is the point of it.
@@ -195,6 +205,12 @@ file where it was.
 A queued file keeps the path it was queued under, so moving it leaves the queue pointing where it
 used to be. Move first, queue after.
 
+Taking tracks out of a playlist: open it with `o` from the playlists pane, then `x` — or delete — on
+a row removes that track, the same key the queue uses. The playlist is written as it goes, so the
+file on disk and the listing never disagree, and the cursor stays where it was so a run of tracks
+goes one press at a time. Nothing else is touched: the file itself stays on disk, and a playlist
+emptied this way is still a playlist — `d` in the playlists pane is what deletes one.
+
 Playlists pane. A playlist holds tracks from YouTube as happily as files: the URL goes in the list
 with the title, artist and length beside it, so it comes back named rather than as a link. The
 `tracks` list itself stays a plain list of paths, so a playlist written by an older version still
@@ -203,7 +219,7 @@ loads and one written now still opens in anything that only knows about files.
 | Key | Does |
 | --- | --- |
 | enter | Load the playlist into the queue, replacing it |
-| `o` | Open it in the multimodal panel to look through |
+| `o` | Open it in the multimodal panel to look through, and to remove tracks from |
 | `c` | New playlist |
 | `s` / `r` | Cycle the sort / reverse it |
 | `d` | Delete (asks first) |
@@ -216,6 +232,7 @@ Queue pane:
 | `j` / `k` | Move |
 | enter | Play this entry now |
 | `x`, delete | Take it out of the queue |
+| `X` | Empty the queue and history. A playing song is not in the queue, so it plays on — `S` is what stops. Paused or stopped, it is cleared too |
 
 The three played songs above the current one stay visible, so the current song holds its row. The
 pane's title says what repeats when anything does — `Queue · repeat song`.
@@ -271,8 +288,9 @@ What this fetches is between you and the rights holder — yt-dlp is the same to
 | --- | --- |
 | Master volume | Fader applied to everything, shown as a percentage and in dB. Left / right adjust, `0`-`9` set the level |
 | Default folder | The folder the library is built from. `enter` types a path, `d` clears it |
-| Fill metadata | Writes missing artwork into your music files. **Off by default — it modifies your files** |
-| Look online | Lets the filling ask MusicBrainz and iTunes instead of only reading the disk. Off by default, and separate from the above on purpose. Needs Fill metadata on |
+| Fill metadata | Writes missing artwork and genres into your music files. **Off by default — it modifies your files** |
+| Look online | Lets the artwork filling ask MusicBrainz and iTunes instead of only reading the disk. Off by default, and separate from the above on purpose. Needs Fill metadata on |
+| Genre lookup | Fills in a missing genre from MusicBrainz or iTunes. Its own switch, off by default. **Only ever fills a blank** — a genre already in the file, or typed in with `e`, is never replaced. Needs Fill metadata on |
 | Control hints | Whether the keys are listed on each screen. On by default, and applies as soon as the config is left — the player waiting behind Continue included |
 | Hide messages | Silences what an action reports. The failures share that line, so turning it on hides those too. Applies straight away, like the hints |
 | On close | What becomes of the daemon when the **last** interface closes: keep it if it was started by hand (default), always kill it, or always keep it. Closing one of several interfaces never stops playback — see [Several interfaces at once](#several-interfaces-at-once) |
@@ -283,6 +301,21 @@ What this fetches is between you and the rights holder — yt-dlp is the same to
 
 `s` saves. `q` or esc leaves; unsaved edits are still live for the session, but only the file survives
 a restart.
+
+Where a filled-in genre comes from: the genres MusicBrainz's users have voted for on the release, or
+on the release group it belongs to, and failing that the one genre iTunes files the album under.
+Nothing on disk supplies a genre, so Genre lookup is the only switch that fills one in; it writes
+only where there is no genre at all, which leaves anything you tagged yourself alone. Covers and
+genres share one pass per release, so turning both on does not double the requests.
+
+Where filled-in artwork comes from, in order: an image beside the music under a conventional name
+(`cover.jpg`, `folder.png`, …), then a picture already embedded in another track **of the same
+release** in that folder, then — with Look online on — the Cover Art Archive or iTunes for the album
+the tags name. A file that already has a picture is never touched, and a file whose tags do not say
+which album it is from borrows nothing from its neighbours: in a folder holding several releases, as
+a downloads folder does, there is no way to tell whose cover is whose, and the wrong cover is worse
+than none. The one folder-wide source is a conventionally named image, which is the folder's own
+cover by convention.
 
 ### Command line
 
@@ -315,6 +348,7 @@ ok: queued 24 from Late Night by title
 | `queue_stream <url>` | Add a track from the network to the queue |
 | `volume <±points>` | Move the volume, e.g. `10` or `-5` |
 | `seek <±seconds>` | Move the position, e.g. `30` or `-10` |
+| `queue_clear` | Empty the queue and the history, leaving a playing song alone |
 | `stop` | Halt playback and rewind, keeping the queue |
 | `clear` | Stop and forget the queue and history |
 | `status` | Report what is playing, as JSON, including what repeats and what any streams are called |
@@ -442,6 +476,7 @@ master_volume = 0.5
 default_folder = "/home/you/Music"
 auto_fill_metadata = false
 fetch_artwork_online = false
+fetch_genres_online = false
 show_control_hints = true
 hide_status_messages = false
 daemon_on_close = "stop_if_we_started_it"

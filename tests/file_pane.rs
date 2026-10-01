@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use ogma::player::Player;
 use ogma::ui::FilePane;
+use ogma::song::Song;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -1117,4 +1118,162 @@ fn every_mode_lists_its_own_keys_in_full() {
     for keys in ["a queue", "A all", "P playlist", "bksp back", "/ find", "m mode"] {
         assert!(playlist.contains(keys), "the playlist mode does not show {keys}:\n{playlist}");
     }
+}
+
+// -------------------------------------------------------------------------------------- genres
+
+/// Type `text` into whatever prompt is open.
+fn type_text(pane: &mut FilePane, player: &mut Player, text: &str) {
+    for c in text.chars() {
+        press(pane, player, KeyCode::Char(c));
+    }
+}
+
+/// Empty the prompt, which is ctrl-u as it is everywhere else in the interface.
+fn clear_prompt(pane: &mut FilePane, player: &mut Player) {
+    let key = KeyEvent::new(
+        KeyCode::Char('u'),
+        ratatui::crossterm::event::KeyModifiers::CONTROL,
+    );
+
+    pane.handle_key(key, player);
+}
+
+#[test]
+fn e_types_a_genre_onto_the_highlighted_track() {
+    let dir = common::scratch_dir("pane-genre-one");
+    common::write_wav(
+        &dir,
+        &common::WavSpec {
+            name: "01-track.wav",
+            title: Some("Xtal"),
+            ..common::WavSpec::default()
+        },
+    );
+    common::write_wav(
+        &dir,
+        &common::WavSpec {
+            name: "02-other.wav",
+            title: Some("Ptolemy"),
+            ..common::WavSpec::default()
+        },
+    );
+
+    // Both start out tagged, so what the prompt offers and what it leaves alone are both visible.
+    for name in ["01-track.wav", "02-other.wav"] {
+        ogma::genre::set(&dir.join(name), "Ambient");
+    }
+
+    let mut player = Player::new();
+    let mut pane = FilePane::at(&dir);
+
+    // Onto the first track, then open the prompt. It starts with what the file already says, so a
+    // genre that is nearly right is corrected rather than retyped.
+    press(&mut pane, &mut player, KeyCode::Down);
+    assert!(press(&mut pane, &mut player, KeyCode::Char('e')));
+    assert!(pane.is_typing(), "the keys go into the prompt now");
+
+    let frame = render_at(&mut pane, true, 40);
+    assert!(frame.contains("genre: Ambient"), "the prompt offers what is there: {frame}");
+
+    // Clear it and type something else.
+    clear_prompt(&mut pane, &mut player);
+    type_text(&mut pane, &mut player, "Shoegaze");
+    press(&mut pane, &mut player, KeyCode::Enter);
+
+    assert!(!pane.is_typing(), "the prompt is answered");
+    wait_for(&mut pane, |pane| render_at(pane, true, 40).contains("genre Shoegaze"));
+
+    assert_eq!(Song::new(dir.join("01-track.wav")).genre(), Some("Shoegaze"));
+    assert_eq!(
+        Song::new(dir.join("02-other.wav")).genre(),
+        Some("Ambient"),
+        "the row that was not highlighted is left alone"
+    );
+
+    // Asked again, the prompt now offers what was just written: the listing re-read the file.
+    press(&mut pane, &mut player, KeyCode::Char('e'));
+    let frame = render_at(&mut pane, true, 40);
+    assert!(frame.contains("genre: Shoegaze"), "{frame}");
+}
+
+#[test]
+fn a_genre_typed_onto_a_folder_reaches_every_track_under_it() {
+    let dir = common::scratch_dir("pane-genre-folder");
+    let album = dir.join("album");
+    std::fs::create_dir_all(&album).expect("create album folder");
+
+    for name in ["01.wav", "02.wav"] {
+        common::write_wav(&album, &common::WavSpec { name, ..common::WavSpec::default() });
+    }
+
+    let mut player = Player::new();
+    let mut pane = FilePane::at(&dir);
+
+    // The folder is the first row under `..`.
+    press(&mut pane, &mut player, KeyCode::Down);
+    press(&mut pane, &mut player, KeyCode::Char('e'));
+
+    // The prompt says how many it will touch, before it is answered rather than after.
+    let frame = render_at(&mut pane, true, 40);
+    assert!(frame.contains("genre ×2"), "{frame}");
+
+    clear_prompt(&mut pane, &mut player);
+    type_text(&mut pane, &mut player, "Jungle");
+    press(&mut pane, &mut player, KeyCode::Enter);
+
+    wait_for(&mut pane, |pane| render_at(pane, true, 40).contains("2 tracks"));
+
+    for name in ["01.wav", "02.wav"] {
+        assert_eq!(Song::new(album.join(name)).genre(), Some("Jungle"), "{name}");
+    }
+}
+
+#[test]
+fn an_abandoned_or_empty_genre_writes_nothing() {
+    let dir = common::scratch_dir("pane-genre-cancel");
+    common::write_wav(&dir, &common::WavSpec { name: "track.wav", ..common::WavSpec::default() });
+    ogma::genre::set(&dir.join("track.wav"), "Ambient");
+
+    let mut player = Player::new();
+    let mut pane = FilePane::at(&dir);
+
+    press(&mut pane, &mut player, KeyCode::Down);
+
+    // Escaped.
+    press(&mut pane, &mut player, KeyCode::Char('e'));
+    type_text(&mut pane, &mut player, "Gabber");
+    press(&mut pane, &mut player, KeyCode::Esc);
+
+    assert!(!pane.is_typing());
+    assert_eq!(Song::new(dir.join("track.wav")).genre(), Some("Ambient"), "untouched");
+
+    // Answered with nothing. An empty prompt is a cancellation, not an instruction to clear the
+    // genre: the two cannot be told apart, and clearing is the wrong one to guess at.
+    press(&mut pane, &mut player, KeyCode::Char('e'));
+    clear_prompt(&mut pane, &mut player);
+    press(&mut pane, &mut player, KeyCode::Enter);
+
+    assert!(render_at(&mut pane, true, 40).contains("no genre typed"));
+    assert_eq!(Song::new(dir.join("track.wav")).genre(), Some("Ambient"), "still untouched");
+}
+
+#[test]
+fn a_stream_has_no_file_to_tag() {
+    let dir = common::scratch_dir("pane-genre-stream");
+    let mut player = Player::new();
+    let mut pane = FilePane::at(&dir);
+
+    fake_yt_dlp();
+    press(&mut pane, &mut player, KeyCode::Char('m'));
+    press(&mut pane, &mut player, KeyCode::Char('m'));
+    press(&mut pane, &mut player, KeyCode::Char('/'));
+    type_text(&mut pane, &mut player, "aphex");
+    press(&mut pane, &mut player, KeyCode::Enter);
+    wait_for(&mut pane, |pane| !pane.results().is_empty());
+
+    press(&mut pane, &mut player, KeyCode::Char('e'));
+
+    assert!(!pane.is_typing(), "there is nothing to type into");
+    assert!(render_at(&mut pane, true, 40).contains("no file to tag"));
 }

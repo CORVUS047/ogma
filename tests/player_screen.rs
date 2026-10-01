@@ -349,6 +349,26 @@ fn x_removes_the_highlighted_queue_entry() {
 }
 
 #[test]
+fn capital_x_empties_the_queue_without_stopping_the_music() {
+    let mut player = playing();
+    let mut screen = isolated_screen();
+    focus_queue(&mut screen, &mut player);
+
+    press(&mut screen, &mut player, KeyCode::Char('X'));
+
+    assert!(player.queue().is_empty(), "the lot, not just the highlighted row");
+    assert_eq!(player.current(), Some(&song("first")), "what is playing is not in the queue");
+    assert!(player.is_playing(), "so clearing the queue does not stop it");
+
+    // The key is listed with the queue's own, and an empty queue takes no more clearing.
+    let frame = frame_of(&mut screen, &player);
+    assert!(frame.contains("X clear"), "{frame}");
+
+    press(&mut screen, &mut player, KeyCode::Char('X'));
+    assert!(player.queue().is_empty());
+}
+
+#[test]
 fn queue_keys_do_nothing_while_another_pane_has_focus() {
     let mut player = playing();
     let mut screen = isolated_screen();
@@ -356,6 +376,7 @@ fn queue_keys_do_nothing_while_another_pane_has_focus() {
     // The playlists pane claims nothing, so its keys fall through harmlessly.
     press(&mut screen, &mut player, KeyCode::Char('h'));
     press(&mut screen, &mut player, KeyCode::Char('x'));
+    press(&mut screen, &mut player, KeyCode::Char('X'));
 
     assert_eq!(player.queue().len(), 3, "the queue is left alone");
     assert_eq!(player.current(), Some(&song("first")));

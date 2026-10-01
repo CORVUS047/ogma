@@ -185,6 +185,45 @@ impl PlaylistPane {
         }
     }
 
+    /// Take `song` out of the playlist called `name` and save it.
+    ///
+    /// Returns the playlist as it now stands, for the file listing the row came from to show again,
+    /// or why it could not be done. Like adding, removing spans two panes — the file listing says
+    /// which track, this pane owns the playlist — so the screen routes it here.
+    ///
+    /// The write happens before the change is kept, so a playlist that cannot be saved is left as
+    /// it was rather than losing a track in memory only.
+    pub fn remove_song(&mut self, name: &str, song: &Song) -> Result<Playlist, String> {
+        let outcome = self.removing(name, song);
+
+        self.status = Some(match &outcome {
+            Ok(playlist) => format!("removed {} from {}", song.display_title(), playlist.name()),
+            Err(message) => message.clone(),
+        });
+
+        outcome
+    }
+
+    /// The work behind [`PlaylistPane::remove_song`], leaving the message to it.
+    fn removing(&mut self, name: &str, song: &Song) -> Result<Playlist, String> {
+        let index = self
+            .playlists
+            .iter()
+            .position(|playlist| playlist.name() == name)
+            .ok_or_else(|| format!("no playlist called {name}"))?;
+
+        let mut updated = self.playlists[index].clone();
+
+        if !updated.remove_song(song) {
+            return Err(format!("{} is not in {name}", song.display_title()));
+        }
+
+        updated.save().map_err(|err| format!("cannot save: {err}"))?;
+        self.playlists[index] = updated.clone();
+
+        Ok(updated)
+    }
+
     /// Handle a key press, acting on `player` where the key asks for it.
     ///
     /// Returns `true` when the key belonged to this pane.

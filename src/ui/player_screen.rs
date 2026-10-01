@@ -194,6 +194,27 @@ impl PlayerScreen {
             return None;
         }
 
+        // Taking a track out spans the same two panes as putting one in, the other way about: the
+        // listing says which row, the playlists pane owns the playlist and writes it.
+        if pane_keys
+            && self.focus == Focus::Files
+            && matches!(key.code, KeyCode::Char('x') | KeyCode::Delete)
+            && let Some(name) = self.files.open_playlist().map(str::to_string)
+        {
+            match self.files.highlighted_songs().into_iter().next() {
+                Some(song) => match self.playlists.remove_song(&name, &song) {
+                    Ok(playlist) => {
+                        self.files.refresh_playlist(&playlist);
+                        self.files.report(format!("removed {}", song.display_title()));
+                    }
+                    Err(message) => self.files.report(message),
+                },
+                None => self.files.report("nothing to remove"),
+            }
+
+            return None;
+        }
+
         if pane_keys && self.focus == Focus::Playlists {
             match self.playlists.handle_key(key, player) {
                 // Opening a playlist puts it in the file listing, where it can be looked through.
@@ -267,6 +288,8 @@ impl PlayerScreen {
             KeyCode::Char('x') | KeyCode::Delete if self.focus == Focus::Queue => {
                 self.remove_selected(player)
             }
+            // A capital, like the other keys that act on more than the highlighted row.
+            KeyCode::Char('X') if self.focus == Focus::Queue => self.clear_queue(player),
 
             KeyCode::Esc | KeyCode::Char('q') => return Some(PlayerScreenOutcome::Close),
 
@@ -326,6 +349,16 @@ impl PlayerScreen {
         if let Some(index) = self.queue_state.selected() {
             player.remove_queue(index);
         }
+    }
+
+    /// Empty the queue and the history.
+    ///
+    /// A song that is playing is not part of the queue, so clearing it does not stop the music: the
+    /// song plays out and nothing follows it. `S` is what stops. With playback already stopped or
+    /// paused there is nothing to cut off, so that song is cleared away as well.
+    fn clear_queue(&mut self, player: &mut dyn Controls) {
+        player.clear_queue();
+        self.queue_state.select(None);
     }
 
     /// Keep the selection inside the queue after it has shrunk.
@@ -660,8 +693,9 @@ impl PlayerScreen {
         // Two spellings, so a narrow pane says less rather than showing a clipped line. The repeat key
         // is not among them: it belongs to the transport, which names it, and what it is set to is in
         // this pane's title.
-        const LONG: &str = "enter play · x remove";
-        const SHORT: &str = "enter · x";
+        const LONG: &str = "enter play · x remove · X clear";
+        const MEDIUM: &str = "enter · x remove · X clear";
+        const SHORT: &str = "enter · x · X";
 
         // Listed only while the pane has the keys, as the other panes' are: keys that do nothing to
         // what is highlighted would be a lie.
@@ -670,7 +704,7 @@ impl PlayerScreen {
         }
 
         let room = area.width as usize;
-        let keys = [LONG, SHORT]
+        let keys = [LONG, MEDIUM, SHORT]
             .into_iter()
             .find(|candidate| candidate.chars().count() <= room)
             .unwrap_or("");

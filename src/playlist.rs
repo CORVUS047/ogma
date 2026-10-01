@@ -277,12 +277,19 @@ impl Playlist {
         self.songs.len() - before
     }
 
-    /// Remove the track at `index` of the *sorted* order, which is what the interface shows.
-    pub fn remove(&mut self, index: usize) -> Option<Song> {
-        let song = self.ordered().get(index)?.to_owned().clone();
-        let position = self.songs.iter().position(|candidate| *candidate == song)?;
+    /// Remove `song` wherever it sits in the playlist, returning whether it was there.
+    ///
+    /// Tracks are matched rather than counted, so a caller holding a row from a sorted or narrowed
+    /// listing does not have to work out which of the added-order positions it is.
+    pub fn remove_song(&mut self, song: &Song) -> bool {
+        match self.songs.iter().position(|candidate| candidate == song) {
+            Some(position) => {
+                self.songs.remove(position);
 
-        Some(self.songs.remove(position))
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn clear(&mut self) {
