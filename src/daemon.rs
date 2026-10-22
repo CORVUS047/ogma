@@ -389,7 +389,7 @@ impl Daemon {
             },
 
             // --- playlists, by name ---
-            Command::LoadPlaylist(name) => match find_playlist(&name) {
+            Command::LoadPlaylist(name) => match self.playlist_named(&name) {
                 Some(playlist) => {
                     self.player.replace_queue_with_playlist(&playlist);
 
@@ -402,7 +402,7 @@ impl Daemon {
                 }
                 None => format!("error: no playlist matching {name:?}"),
             },
-            Command::AddPlaylist(name) => match find_playlist(&name) {
+            Command::AddPlaylist(name) => match self.playlist_named(&name) {
                 Some(playlist) => {
                     let added = playlist.len();
                     self.player.add_queue_all(playlist.ordered_songs());
@@ -545,6 +545,23 @@ impl Daemon {
         }
 
         library::scan(self.library_root.as_ref()?).into_iter().find(matches)
+    }
+
+    /// The saved playlist `name` names, with any track whose file has moved looked for again.
+    ///
+    /// A command can arrive here with no interface running, so this is where a playlist asked for
+    /// by name gets the same check the interface does on the way in. What is found is written back,
+    /// so the search is not repeated for the next command.
+    fn playlist_named(&self, name: &str) -> Option<Playlist> {
+        let mut playlist = find_playlist(name)?;
+
+        if let Some(root) = &self.library_root
+            && playlist.resolve_missing(root).any()
+        {
+            let _ = playlist.save();
+        }
+
+        Some(playlist)
     }
 }
 

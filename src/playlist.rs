@@ -1,15 +1,24 @@
 //! Named collections of tracks, kept as TOML beside the config.
 //!
+//! A playlist is a list of paths, and a path stops being true the moment something moves the file.
+//! Two things keep one honest. A move made through ogma rewrites every playlist that held the
+//! track, so the paths follow the file. A move made by anything else is noticed the next time the
+//! playlist is loaded, and the track is looked for by the fingerprint of its audio — see
+//! [`crate::fingerprint`] and [`Playlist::resolve_missing`].
+//!
 //! A playlist holds its tracks in the order they were added and a sort setting on top of that. The
 //! sort is not a view: [`Playlist::ordered`] is what the interface lists *and* what replaces the
 //! queue, so what is seen and what plays are the same sequence. Switching back to
 //! [`SortBy::Manual`] restores the order the tracks were added in, which is why that order is the
 //! one stored.
 
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::fingerprint;
 use crate::song::Song;
 
 /// Directory under the config directory that playlists live in.
@@ -119,14 +128,66 @@ impl From<toml::ser::Error> for PlaylistError {
     }
 }
 
+/// What is known about one track beyond where it sits, so that it can be found again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Print {
+    /// The fingerprint of the track's audio, from [`crate::fingerprint::of`].
+    audio: u128,
+    /// Set once a search for this track has swept the library and come up empty.
+    ///
+    /// A track that was deleted rather than moved is never going to be found, and without this
+    /// every load would hash the whole library again looking for it. The flag is cleared by
+    /// [`Playlist::forget_unresolved`], which is how a search is asked for a second time once the
+    /// file might plausibly be back.
+    unresolved: bool,
+}
+
+/// What a pass of [`Playlist::resolve_missing`] found.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Resolution {
+    /// Tracks found somewhere else: where they were, and where they now are.
+    pub moved: Vec<(PathBuf, PathBuf)>,
+    /// Tracks that are gone and that a sweep of the library did not turn up.
+    pub lost: Vec<PathBuf>,
+}
+
+impl Resolution {
+    /// Whether anything at all came of the pass, and so whether the playlist needs writing.
+    pub fn any(&self) -> bool {
+        !self.moved.is_empty() || !self.lost.is_empty()
+    }
+}
+
 /// A named list of tracks.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Playlist {
     name: String,
     /// Tracks in the order they were added; [`Playlist::ordered`] applies the sort.
     songs: Vec<Song>,
     sort: SortBy,
     descending: bool,
+    /// How to find each track again if its path stops being true, by path.
+    ///
+    /// Kept beside the songs rather than inside them because a [`Song`] is a pointer at a path that
+    /// costs nothing to make, and fingerprinting is a read: only a track that someone has committed
+    /// to a playlist is worth the read. A track with no entry here — a stream, or a file that could
+    /// not be read when it was added — simply cannot be followed, which is how every track behaved
+    /// before fingerprints existed.
+    prints: HashMap<PathBuf, Print>,
+}
+
+/// Two playlists are equal when they are the same tracks, named and ordered the same way.
+///
+/// Fingerprints are what is known *about* those tracks rather than part of the playlist, and a
+/// playlist that has been saved and read back holds the same tracks whether or not every one of
+/// them could be fingerprinted at the time.
+impl PartialEq for Playlist {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.songs == other.songs
+            && self.sort == other.sort
+            && self.descending == other.descending
+    }
 }
 
 /// The shape a playlist takes on disk.
@@ -150,6 +211,24 @@ struct OnDisk {
     /// come back as its own link.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     streams: Vec<OnDiskStream>,
+    /// How to find the entries in `tracks` that are files, should they move.
+    ///
+    /// Beside the list for the same reason `streams` is: `tracks` stays a plain list of paths, so
+    /// the interesting half of a playlist file is still readable and editable by hand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    files: Vec<OnDiskFile>,
+}
+
+/// How one track can be found again after it moves, for the playlist file.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OnDiskFile {
+    path: String,
+    /// The fingerprint of the first megabyte of the track's audio, as hex.
+    audio: String,
+    /// Set when the track is gone and a sweep of the library has already failed to find it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    unresolved: bool,
 }
 
 /// What a track played from the network is called, for the playlist file.
@@ -200,12 +279,16 @@ impl Playlist {
             songs: Vec::new(),
             sort: SortBy::default(),
             descending: false,
+            prints: HashMap::new(),
         }
     }
 
-    /// A playlist called `name` holding `songs`.
+    /// A playlist called `name` holding `songs`, fingerprinting each of them.
     pub fn with_songs(name: impl Into<String>, songs: impl IntoIterator<Item = Song>) -> Self {
-        Playlist { songs: songs.into_iter().collect(), ..Self::new(name) }
+        let mut playlist = Self::new(name);
+        playlist.add_all(songs);
+
+        playlist
     }
 
     pub fn name(&self) -> &str {
@@ -257,8 +340,12 @@ impl Playlist {
         &self.songs
     }
 
-    /// Add a track to the end.
+    /// Add a track to the end, fingerprinting it so it can be followed if it moves.
+    ///
+    /// Adding reads the start of the file. That is the price of being able to find the track again,
+    /// and it is paid once, here, rather than on every load.
     pub fn add(&mut self, song: Song) {
+        self.take_print(&song);
         self.songs.push(song);
     }
 
@@ -270,11 +357,25 @@ impl Playlist {
 
         for song in songs {
             if !self.songs.contains(&song) {
-                self.songs.push(song);
+                self.add(song);
             }
         }
 
         self.songs.len() - before
+    }
+
+    /// Fingerprint `song` and keep it, unless there is nothing to fingerprint.
+    ///
+    /// A stream has no file, and a file that cannot be read has no audio to hash. Either way the
+    /// track is simply one that cannot be followed.
+    fn take_print(&mut self, song: &Song) {
+        if song.is_stream() || self.prints.contains_key(song.path()) {
+            return;
+        }
+
+        if let Some(audio) = fingerprint::of(song.path()) {
+            self.prints.insert(song.path().to_path_buf(), Print { audio, unresolved: false });
+        }
     }
 
     /// Remove `song` wherever it sits in the playlist, returning whether it was there.
@@ -284,7 +385,12 @@ impl Playlist {
     pub fn remove_song(&mut self, song: &Song) -> bool {
         match self.songs.iter().position(|candidate| candidate == song) {
             Some(position) => {
-                self.songs.remove(position);
+                let removed = self.songs.remove(position);
+
+                // Only once no other row points at the path: the same file can be listed twice.
+                if !self.songs.contains(&removed) {
+                    self.prints.remove(removed.path());
+                }
 
                 true
             }
@@ -294,6 +400,7 @@ impl Playlist {
 
     pub fn clear(&mut self) {
         self.songs.clear();
+        self.prints.clear();
     }
 
     /// The tracks in the playlist's sort order.
@@ -318,6 +425,179 @@ impl Playlist {
     /// The tracks in sort order, cloned, ready to hand to the player.
     pub fn ordered_songs(&self) -> Vec<Song> {
         self.ordered().into_iter().cloned().collect()
+    }
+
+    // ------------------------------------------------------------- following tracks that move
+
+    /// Point every track that was at `old` at `new` instead, returning how many moved.
+    ///
+    /// `old` may be a file or a folder: a folder that has been moved takes everything below it, so
+    /// a playlist full of an album's tracks follows the album. The fingerprint moves with the
+    /// track, since a move does not change the audio.
+    ///
+    /// This is the path a move made through ogma takes. Nothing is read and nothing is searched
+    /// for — the new location is already known, so there is no reason to go looking for it.
+    pub fn retarget(&mut self, old: &Path, new: &Path) -> usize {
+        let mut moved = 0;
+
+        for index in 0..self.songs.len() {
+            if self.songs[index].is_stream() {
+                continue;
+            }
+
+            let was = self.songs[index].path().to_path_buf();
+
+            let Some(now) = moved_path(&was, old, new) else {
+                continue;
+            };
+
+            if let Some(print) = self.prints.remove(&was) {
+                self.prints.insert(now.clone(), print);
+            }
+
+            self.songs[index] = Song::new(now);
+            moved += 1;
+        }
+
+        moved
+    }
+
+    /// Apply several moves at once, returning how many tracks moved in total.
+    pub fn retarget_all<'a>(
+        &mut self,
+        moves: impl IntoIterator<Item = (&'a Path, &'a Path)>,
+    ) -> usize {
+        moves.into_iter().map(|(old, new)| self.retarget(old, new)).sum()
+    }
+
+    /// Look under `root` for every track whose file is no longer where the playlist says.
+    ///
+    /// This is the path a move made by anything other than ogma takes — a file manager, a shell, a
+    /// tag editor that rewrites rather than edits in place. Each missing track is looked for by the
+    /// fingerprint taken when it was added, so it is found wherever it went and whatever it is now
+    /// called.
+    ///
+    /// Three things keep the cost down, because a sweep means hashing files:
+    ///
+    /// * nothing is read at all unless a track is actually missing, and the check for that is a
+    ///   [`Path::exists`] per track;
+    /// * files sharing a name with something missing are hashed first, since a move usually keeps
+    ///   the name, and the sweep stops as soon as everything has been found;
+    /// * every missing track is searched for in the *same* sweep, so a whole album that moved costs
+    ///   one pass over the library rather than one per track.
+    ///
+    /// A track the sweep does not find is marked, and later passes skip it rather than sweeping the
+    /// library again for a file that was deleted. [`Playlist::forget_unresolved`] takes the marks
+    /// off.
+    ///
+    /// The playlist is changed but not saved: the caller decides when to write, and
+    /// [`Resolution::any`] says whether there is anything to write.
+    pub fn resolve_missing(&mut self, root: &Path) -> Resolution {
+        let mut resolution = Resolution::default();
+
+        // What to look for, by fingerprint. A track with no fingerprint, and one already searched
+        // for and not found, are both left exactly as they are.
+        //
+        // Several paths can share a fingerprint, since the same recording can sit in a library
+        // twice. Each of them is a separate track to find, and each found file answers for one of
+        // them — which one does not matter, the audio being identical.
+        let mut wanted: HashMap<u128, Vec<PathBuf>> = HashMap::new();
+        let mut asked = HashSet::new();
+
+        for song in &self.songs {
+            if song.is_stream() || song.path().exists() || !asked.insert(song.path()) {
+                continue;
+            }
+
+            if let Some(print) = self.prints.get(song.path())
+                && !print.unresolved
+            {
+                wanted.entry(print.audio).or_default().push(song.path().to_path_buf());
+            }
+        }
+
+        if wanted.is_empty() {
+            return resolution;
+        }
+
+        // A file the playlist already points at is not a candidate: it is accounted for.
+        let held: HashSet<PathBuf> =
+            self.songs.iter().map(|song| song.path().to_path_buf()).collect();
+
+        // The names being looked for, so the likely candidates can be hashed before the rest.
+        let names: HashSet<OsString> = wanted
+            .values()
+            .flatten()
+            .filter_map(|path| path.file_name().map(|name| name.to_os_string()))
+            .collect();
+
+        let (likely, rest): (Vec<PathBuf>, Vec<PathBuf>) = crate::library::paths(root)
+            .into_iter()
+            .filter(|path| !held.contains(path))
+            .partition(|path| {
+                path.file_name().is_some_and(|name| names.contains(name))
+            });
+
+        for candidate in likely.into_iter().chain(rest) {
+            if wanted.is_empty() {
+                break;
+            }
+
+            let Some(audio) = fingerprint::of(&candidate) else {
+                continue;
+            };
+
+            if let Some(paths) = wanted.get_mut(&audio) {
+                let was = paths.pop().expect("a fingerprint being looked for has a path");
+
+                if paths.is_empty() {
+                    wanted.remove(&audio);
+                }
+
+                self.retarget(&was, &candidate);
+                resolution.moved.push((was, candidate));
+            }
+        }
+
+        // Whatever is left is not under the library root at all.
+        for was in wanted.into_values().flatten() {
+            if let Some(print) = self.prints.get_mut(&was) {
+                print.unresolved = true;
+            }
+
+            resolution.lost.push(was);
+        }
+
+        resolution.moved.sort();
+        resolution.lost.sort();
+
+        resolution
+    }
+
+    /// Let the next [`Playlist::resolve_missing`] search again for tracks it has given up on.
+    ///
+    /// Returns how many tracks were being skipped.
+    pub fn forget_unresolved(&mut self) -> usize {
+        let mut forgotten = 0;
+
+        for print in self.prints.values_mut() {
+            if print.unresolved {
+                print.unresolved = false;
+                forgotten += 1;
+            }
+        }
+
+        forgotten
+    }
+
+    /// Whether `song`'s file is gone and has already been searched for without being found.
+    ///
+    /// What the interface marks a row with, so a track that is listed but cannot be played says so
+    /// rather than failing silently when it is reached.
+    pub fn is_lost(&self, song: &Song) -> bool {
+        !song.is_stream()
+            && !song.path().exists()
+            && self.prints.get(song.path()).is_none_or(|print| print.unresolved)
     }
 
     // ------------------------------------------------------------------------------ on disk
@@ -379,6 +659,7 @@ impl Playlist {
             descending: self.descending,
             tracks: self.songs.iter().map(|song| song.uri()).collect(),
             streams: self.songs.iter().filter_map(OnDiskStream::of).collect(),
+            files: self.fingerprints(),
         };
 
         std::fs::write(path, toml::to_string_pretty(&on_disk)?)?;
@@ -404,12 +685,42 @@ impl Playlist {
             })
             .collect();
 
+        let prints = on_disk
+            .files
+            .iter()
+            .filter_map(|file| {
+                let audio = fingerprint::from_hex(&file.audio)?;
+
+                Some((PathBuf::from(&file.path), Print { audio, unresolved: file.unresolved }))
+            })
+            .collect();
+
         Ok(Playlist {
             name: on_disk.name,
             songs,
             sort: on_disk.sort,
             descending: on_disk.descending,
+            prints,
         })
+    }
+
+    /// The fingerprints to write, in the order the tracks were added so the file is stable.
+    fn fingerprints(&self) -> Vec<OnDiskFile> {
+        let mut written = HashSet::new();
+
+        self.songs
+            .iter()
+            .filter(|song| written.insert(song.path().to_path_buf()))
+            .filter_map(|song| {
+                let print = self.prints.get(song.path())?;
+
+                Some(OnDiskFile {
+                    path: song.uri(),
+                    audio: fingerprint::to_hex(print.audio),
+                    unresolved: print.unresolved,
+                })
+            })
+            .collect()
     }
 
     /// Every playlist in the playlists directory, by name.
@@ -452,6 +763,18 @@ impl Playlist {
             Err(err) => Err(err.into()),
         }
     }
+}
+
+/// Where `path` ends up when `old` is moved to `new`, or `None` when the move does not touch it.
+///
+/// `old` is either the path itself — one file moved — or a folder it sits under, in which case the
+/// part of the path below that folder is carried across unchanged.
+fn moved_path(path: &Path, old: &Path, new: &Path) -> Option<PathBuf> {
+    if path == old {
+        return Some(new.to_path_buf());
+    }
+
+    path.strip_prefix(old).ok().map(|rest| new.join(rest))
 }
 
 /// A name turned into a file stem: lowercase, with runs of anything but letters and digits becoming

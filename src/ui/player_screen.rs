@@ -83,8 +83,15 @@ impl PlayerScreen {
     }
 
     /// Open with the file listing rooted at `root`.
+    ///
+    /// The playlists are checked against the library on the way in: a track whose file was moved by
+    /// something other than ogma is looked for by the fingerprint of its audio, so a playlist that
+    /// would otherwise hold a dead path comes up pointing at the file where it now is.
     pub fn browsing(root: &std::path::Path) -> Self {
-        PlayerScreen { files: FilePane::at(root), ..Self::default() }
+        let mut screen = PlayerScreen { files: FilePane::at(root), ..Self::default() };
+        screen.playlists.resolve_missing(root);
+
+        screen
     }
 
     /// Open with the given playlists rather than whatever is on disk.
@@ -93,6 +100,29 @@ impl PlayerScreen {
             files: FilePane::at(root),
             playlists: PlaylistPane::with_playlists(playlists),
             ..Self::default()
+        }
+    }
+
+    /// Hand the playlists whatever the listing has just moved, so their paths follow the files.
+    ///
+    /// Moving spans two panes the way adding and removing do: the listing moves the file, the
+    /// playlists pane owns the playlists and writes them.
+    fn follow_moved_files(&mut self) {
+        let moves = self.files.take_moves();
+
+        if moves.is_empty() {
+            return;
+        }
+
+        if self.playlists.follow_moves(&moves) == 0 {
+            return;
+        }
+
+        // A playlist on screen is a listing of paths that have just changed.
+        if let Some(name) = self.files.open_playlist().map(str::to_string)
+            && let Some(playlist) = self.playlists.named(&name).cloned()
+        {
+            self.files.refresh_playlist(&playlist);
         }
     }
 
@@ -229,6 +259,8 @@ impl PlayerScreen {
         }
 
         if pane_keys && self.focus == Focus::Files && self.files.handle_key(key, player) {
+            self.follow_moved_files();
+
             return None;
         }
 

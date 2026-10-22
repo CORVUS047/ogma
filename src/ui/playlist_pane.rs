@@ -1,5 +1,7 @@
 //! The playlists pane: keep named lists of tracks, and send one to the queue.
 
+use std::path::{Path, PathBuf};
+
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::style::Modifier;
@@ -149,6 +151,11 @@ impl PlaylistPane {
         self.playlists.get_mut(index)
     }
 
+    /// The playlist called `name`, if there is one.
+    pub fn named(&self, name: &str) -> Option<&Playlist> {
+        self.playlists.iter().find(|playlist| playlist.name() == name)
+    }
+
     pub fn playlists(&self) -> &[Playlist] {
         &self.playlists
     }
@@ -183,6 +190,98 @@ impl PlaylistPane {
             Some(Err(err)) => self.status = Some(format!("cannot save: {err}")),
             None => {}
         }
+    }
+
+    /// Point every playlist at tracks that have just been moved, and save the ones that changed.
+    ///
+    /// Each pair is where something was and where it now is; a folder stands for everything below
+    /// it. The move has already happened on disk, so the paths here are known rather than searched
+    /// for — the sweep in [`PlaylistPane::resolve_missing`] is for moves ogma did not make.
+    ///
+    /// Returns how many playlist entries followed a file. Each playlist is written as it is
+    /// changed, so a playlist is never only half following the file.
+    pub fn follow_moves(&mut self, moves: &[(PathBuf, PathBuf)]) -> usize {
+        if moves.is_empty() {
+            return 0;
+        }
+
+        let pairs: Vec<(&Path, &Path)> =
+            moves.iter().map(|(old, new)| (old.as_path(), new.as_path())).collect();
+
+        let mut followed = 0;
+        let mut playlists = Vec::new();
+        let mut failed = None;
+
+        for playlist in &self.playlists {
+            let mut updated = playlist.clone();
+
+            match updated.retarget_all(pairs.iter().copied()) {
+                0 => playlists.push(playlist.clone()),
+                count => match updated.save() {
+                    Ok(_) => {
+                        followed += count;
+                        playlists.push(updated);
+                    }
+                    // A playlist that cannot be written is left pointing where it did, which is at
+                    // least what its file still says.
+                    Err(err) => {
+                        failed = Some(err.to_string());
+                        playlists.push(playlist.clone());
+                    }
+                },
+            }
+        }
+
+        self.playlists = playlists;
+
+        if let Some(err) = failed {
+            self.status = Some(format!("cannot save: {err}"));
+        } else if followed > 0 {
+            self.status = Some(match followed {
+                1 => "a playlist followed 1 track".to_string(),
+                count => format!("playlists followed {count} tracks"),
+            });
+        }
+
+        followed
+    }
+
+    /// Look under `root` for playlist tracks whose files have moved without ogma being told.
+    ///
+    /// Run once, when the playlists are first loaded. Nothing is read unless a track is actually
+    /// missing; see [`crate::playlist::Playlist::resolve_missing`] for what a search costs when one
+    /// is. Playlists that changed are saved, so the sweep is not repeated on the next run.
+    ///
+    /// Returns how many tracks were found somewhere else and how many are still missing.
+    pub fn resolve_missing(&mut self, root: &Path) -> (usize, usize) {
+        let mut found = 0;
+        let mut lost = 0;
+
+        for playlist in &mut self.playlists {
+            let resolution = playlist.resolve_missing(root);
+
+            if !resolution.any() {
+                continue;
+            }
+
+            found += resolution.moved.len();
+            lost += resolution.lost.len();
+
+            // Worth writing even when nothing was found: the tracks now marked as not found are
+            // what keeps the next run from sweeping the library for them again.
+            let _ = playlist.save();
+        }
+
+        self.status = Some(match (found, lost) {
+            (0, 0) => return (0, 0),
+            (0, 1) => "1 track missing from the library".to_string(),
+            (0, lost) => format!("{lost} tracks missing from the library"),
+            (1, 0) => "found 1 moved track".to_string(),
+            (found, 0) => format!("found {found} moved tracks"),
+            (found, lost) => format!("found {found} moved, {lost} still missing"),
+        });
+
+        (found, lost)
     }
 
     /// Take `song` out of the playlist called `name` and save it.

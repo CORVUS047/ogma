@@ -202,8 +202,26 @@ itself, or a file that has since gone is refused and stays held, so a second `M`
 one key away. A move between filesystems copies and then removes, so an interrupted one leaves the
 file where it was.
 
-A queued file keeps the path it was queued under, so moving it leaves the queue pointing where it
-used to be. Move first, queue after.
+Playlists follow the file. A track moved with `M` is rewritten in every playlist holding it, so the
+playlists keep playing without anything being searched for — a moved folder takes the whole album's
+tracks with it. The queue does not: a queued file keeps the path it was queued under, so moving it
+leaves the queue pointing where it used to be. Move first, queue after.
+
+A move made by anything other than ogma — a file manager, `mv`, a tag editor that rewrites rather
+than edits in place — is caught the next time the library is opened. Each track is stored with a
+fingerprint of the first megabyte of its audio, taken when it was added, and a track whose file is
+gone is looked for by that fingerprint: it is found wherever under the library root it went, and
+whatever it is now called. The fingerprint covers the audio rather than the file, so filling in
+artwork and genres does not invalidate it. A file carried out of the library altogether is not
+something a search of the library can find.
+
+Searching costs a read per candidate, so it is kept rare. Nothing is read at all unless a track is
+actually missing. Files sharing a name with something missing are tried first, since a move usually
+keeps the name, and every missing track is searched for in the same pass — a whole album that moved
+costs one sweep, not one per track. A track that the sweep does not find is marked in the playlist
+file as `unresolved`, and later runs skip it rather than sweeping the library again for a file that
+was deleted. A playlist open in the panel says how many of its tracks have no file left, beside its
+length and sort.
 
 Taking tracks out of a playlist: open it with `o` from the playlists pane, then `x` — or delete — on
 a row removes that track, the same key the queue uses. The playlist is written as it goes, so the
@@ -213,8 +231,11 @@ emptied this way is still a playlist — `d` in the playlists pane is what delet
 
 Playlists pane. A playlist holds tracks from YouTube as happily as files: the URL goes in the list
 with the title, artist and length beside it, so it comes back named rather than as a link. The
-`tracks` list itself stays a plain list of paths, so a playlist written by an older version still
-loads and one written now still opens in anything that only knows about files.
+`tracks` list itself stays a plain list of paths, editable by hand; the titles of streamed tracks
+and the fingerprints of files sit beside it in `streams` and `files` rather than in it. A playlist
+written by an older version still loads here, and one written here still opens in anything that
+only reads the `tracks` list — though not in an ogma older than the fingerprints, which refuses a
+playlist file with keys it does not know.
 
 | Key | Does |
 | --- | --- |

@@ -153,6 +153,11 @@ pub struct FilePane {
     /// something is to walk somewhere else before putting it down, and the listing changes on the
     /// way.
     held: Vec<PathBuf>,
+    /// Moves this pane has just made, as where each thing was and where it now is.
+    ///
+    /// Waiting to be collected by [`FilePane::take_moves`]. The playlists have to be rewritten so
+    /// their paths follow the files, and this pane does not own them.
+    moved: Vec<(PathBuf, PathBuf)>,
     /// Whether to list the keys under the listing.
     hints: bool,
     /// Whether to report what an action did.
@@ -202,6 +207,7 @@ impl FilePane {
             download_folder: default_download_folder(),
             repaint: false,
             held: Vec::new(),
+            moved: Vec::new(),
             status: None,
             hints: true,
             messages: true,
@@ -763,6 +769,14 @@ impl FilePane {
         });
     }
 
+    /// Take the moves this pane has made since they were last collected.
+    ///
+    /// Each pair is where something was and where it now is. A folder stands for everything below
+    /// it, which is what [`crate::playlist::Playlist::retarget`] expects.
+    pub fn take_moves(&mut self) -> Vec<(PathBuf, PathBuf)> {
+        std::mem::take(&mut self.moved)
+    }
+
     /// Move everything held into the folder being listed.
     ///
     /// Whatever cannot be moved stays held, so a second attempt somewhere else is one key away, and
@@ -785,7 +799,12 @@ impl FilePane {
 
         for path in std::mem::take(&mut self.held) {
             match move_into(&path, &folder) {
-                Ok(()) => moved += 1,
+                Ok(target) => {
+                    // The playlists need to follow the file, and this pane does not own them: the
+                    // screen collects these and hands them over, the way adding and removing go.
+                    self.moved.push((path, target));
+                    moved += 1;
+                }
                 Err(err) => {
                     last_error = Some(err);
                     failed.push(path);
@@ -1583,11 +1602,14 @@ fn default_download_folder() -> PathBuf {
         .join("ogma")
 }
 
-/// Move `source` into `folder`, keeping its name.
+/// Move `source` into `folder`, keeping its name, and say where it ended up.
+///
+/// The target is returned rather than discarded because the playlists have to be told: a track
+/// that moves through this pane is followed by every playlist holding it.
 ///
 /// Nothing is ever overwritten: a name already taken in the target folder is refused rather than
 /// resolved, since the two files with one name are the user's to sort out, not this pane's.
-fn move_into(source: &Path, folder: &Path) -> Result<(), String> {
+fn move_into(source: &Path, folder: &Path) -> Result<PathBuf, String> {
     let name = source.file_name().ok_or_else(|| format!("{} has no name", source.display()))?;
 
     if !source.exists() {
@@ -1611,12 +1633,12 @@ fn move_into(source: &Path, folder: &Path) -> Result<(), String> {
     }
 
     match std::fs::rename(source, &target) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(target),
         // Another filesystem: a rename cannot span one, so the bytes have to be carried over and
         // the original removed once they are all there.
-        Err(err) if err.raw_os_error() == Some(CROSS_DEVICE) => {
-            copy_across(source, &target).map_err(|err| format!("{}: {err}", name_of(source)))
-        }
+        Err(err) if err.raw_os_error() == Some(CROSS_DEVICE) => copy_across(source, &target)
+            .map(|()| target)
+            .map_err(|err| format!("{}: {err}", name_of(source))),
         Err(err) => Err(format!("{}: {err}", name_of(source))),
     }
 }
@@ -1659,13 +1681,24 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The line under the border while a playlist is listed: how many tracks, and its sort.
+/// The line under the border while a playlist is listed: how many tracks, its sort, and how many
+/// of those tracks have no file left to play.
+///
+/// A track whose file is gone still lists — it is in the playlist, and saying so is better than
+/// quietly dropping it — but it is counted here, since a row that plays nothing is otherwise
+/// indistinguishable from one that does until it is reached.
 fn detail_of(playlist: &Playlist) -> String {
+    let lost = playlist.as_added().iter().filter(|song| playlist.is_lost(song)).count();
+
     format!(
-        "{} · {}{}",
+        "{} · {}{}{}",
         playlist.len(),
         playlist.sort().label(),
-        if playlist.descending() { " ↓" } else { "" }
+        if playlist.descending() { " ↓" } else { "" },
+        match lost {
+            0 => String::new(),
+            lost => format!(" · {lost} missing"),
+        }
     )
 }
 

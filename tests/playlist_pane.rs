@@ -187,6 +187,11 @@ fn c_saves_the_queue_as_a_new_playlist() {
     player.play();
 
     let mut pane = PlaylistPane::with_playlists(Vec::new());
+    // What the player screen hands over on every draw: what is playing, then the queue. Nothing
+    // else tells the pane what a new playlist should hold.
+    let mut queued = vec![tracks[0].clone()];
+    queued.extend(player.queue().iter().cloned());
+    pane.set_queue_to_save(queued);
 
     press(&mut pane, &mut player, KeyCode::Char('c'));
     // The prompt shows what is being typed.
@@ -797,4 +802,77 @@ fn a_new_playlist_clears_the_search_so_it_can_be_seen() {
 
     assert_eq!(pane.filter(), None, "a search that hid the new playlist would look like a failure");
     assert_eq!(pane.selected().map(Playlist::name), Some("Search Cleared"));
+}
+
+#[test]
+fn moving_a_track_in_the_file_listing_takes_the_playlists_with_it() {
+    let directory = redirect();
+
+    let dir = common::scratch_dir("screen-move-tracked");
+    let track = common::write_wav(
+        &dir,
+        &WavSpec { name: "only.wav", title: Some("Only"), ..WavSpec::default() },
+    );
+    std::fs::create_dir_all(dir.join("album")).expect("make the target folder");
+
+    let playlist = Playlist::with_songs("Followed", vec![Song::new(&track)]);
+    playlist.save().expect("save");
+
+    let mut player = Player::new();
+    let mut screen = PlayerScreen::with_playlists(&dir, vec![playlist]);
+
+    // The listing opens with `..` highlighted: down onto `album`, down again onto the track, pick
+    // it up, then into the folder and put it down.
+    screen.handle_key(KeyEvent::from(KeyCode::Down), &mut player);
+    screen.handle_key(KeyEvent::from(KeyCode::Down), &mut player);
+    screen.handle_key(KeyEvent::from(KeyCode::Char('x')), &mut player);
+    screen.handle_key(KeyEvent::from(KeyCode::Up), &mut player);
+    screen.handle_key(KeyEvent::from(KeyCode::Enter), &mut player);
+    screen.handle_key(KeyEvent::from(KeyCode::Char('M')), &mut player);
+
+    let moved = dir.join("album").join("only.wav");
+    assert!(moved.is_file(), "the file moved");
+
+    let saved = Playlist::load_from(&directory.join("followed.toml")).expect("load");
+
+    assert_eq!(
+        saved.as_added()[0].path(),
+        moved,
+        "and the playlist on disk followed it without any searching"
+    );
+    assert!(!saved.is_lost(&Song::new(&moved)));
+}
+
+#[test]
+fn opening_a_library_looks_for_tracks_that_moved_while_ogma_was_closed() {
+    let directory = redirect();
+
+    let dir = common::scratch_dir("screen-resolve-on-open");
+    let track = common::write_wav(
+        &dir,
+        &WavSpec { name: "only.wav", title: Some("Only"), ..WavSpec::default() },
+    );
+
+    let playlist = Playlist::with_songs("Rediscovered", vec![Song::new(&track)]);
+    playlist.save().expect("save");
+
+    // Something other than ogma moves the file, so nothing rewrote the playlist.
+    let elsewhere = dir.join("tidied");
+    std::fs::create_dir_all(&elsewhere).expect("make the folder");
+    let now = elsewhere.join("renamed.wav");
+    std::fs::rename(&track, &now).expect("move the file");
+
+    // Opening the library is where the playlists are checked against what is on disk.
+    let screen = PlayerScreen::browsing(&dir);
+
+    let found = screen
+        .playlists()
+        .iter()
+        .find(|playlist| playlist.name() == "Rediscovered")
+        .expect("the playlist is loaded");
+
+    assert_eq!(found.as_added()[0].path(), now, "found by the fingerprint of its audio");
+
+    let saved = Playlist::load_from(&directory.join("rediscovered.toml")).expect("load");
+    assert_eq!(saved.as_added()[0].path(), now, "and written back, so it is found once");
 }

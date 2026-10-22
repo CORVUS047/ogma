@@ -7,6 +7,7 @@ pub mod browse;
 pub mod claim;
 pub mod config;
 pub mod daemon;
+pub mod fingerprint;
 pub mod genre;
 pub mod ipc;
 pub mod library;
