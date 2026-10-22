@@ -215,13 +215,23 @@ whatever it is now called. The fingerprint covers the audio rather than the file
 artwork and genres does not invalidate it. A file carried out of the library altogether is not
 something a search of the library can find.
 
+Playlists that predate all of this are brought up to date on the way in: opening the library
+fingerprints any track that has none and is still where the playlist says, then writes the playlist
+back, so it is one read per track and only once. A track that was already gone before this version
+first saw the playlist was never there to be fingerprinted, so it cannot be searched for — it is
+still listed, and still counted as missing.
+
 Searching costs a read per candidate, so it is kept rare. Nothing is read at all unless a track is
 actually missing. Files sharing a name with something missing are tried first, since a move usually
 keeps the name, and every missing track is searched for in the same pass — a whole album that moved
-costs one sweep, not one per track. A track that the sweep does not find is marked in the playlist
-file as `unresolved`, and later runs skip it rather than sweeping the library again for a file that
-was deleted. A playlist open in the panel says how many of its tracks have no file left, beside its
-length and sort.
+costs one sweep, not one per track. A track the sweep does not find is written off in the playlist
+file, under `unresolved`, and later runs skip it rather than sweeping the library again for a file
+that was deleted — but only for the library root that was searched: a folder a track was never in
+says nothing about the one it was, so pointing the library elsewhere does not write off everything
+that is not under it.
+
+A playlist open in the panel says how many of its tracks have no file left, beside its length and
+sort — a row that plays nothing should say so rather than being found out when it is reached.
 
 Taking tracks out of a playlist: open it with `o` from the playlists pane, then `x` — or delete — on
 a row removes that track, the same key the queue uses. The playlist is written as it goes, so the

@@ -553,7 +553,10 @@ fn giving_up_is_remembered_in_the_file() {
     playlist.save_to(&path).expect("save");
 
     let text = std::fs::read_to_string(&path).expect("read back");
-    assert!(text.contains("unresolved = true"), "{text}");
+    assert!(
+        text.contains(&format!("unresolved = [\"{}\"]", library_dir.display())),
+        "the mark says which root was swept, not just that one was: {text}"
+    );
 
     // A reload picks the mark back up, so it is one sweep ever rather than one on every run.
     let mut loaded = Playlist::load_from(&path).expect("load");
@@ -620,4 +623,130 @@ fn two_copies_of_one_recording_are_both_found() {
     found.sort();
 
     assert_eq!(found, [first.as_path(), second.as_path()]);
+}
+
+/// A playlist file as the version before fingerprints wrote one.
+fn written_without_fingerprints(dir: &Path, name: &str, songs: &[Song]) -> PathBuf {
+    let tracks: Vec<String> =
+        songs.iter().map(|song| format!("    \"{}\",", song.path().display())).collect();
+
+    let path = dir.join(format!("{}.toml", name.to_lowercase()));
+
+    std::fs::write(
+        &path,
+        format!(
+            "name = \"{name}\"\nsort = \"manual\"\ndescending = false\ntracks = [\n{}\n]\n",
+            tracks.join("\n")
+        ),
+    )
+    .expect("write the old playlist");
+
+    path
+}
+
+#[test]
+fn a_playlist_from_before_fingerprints_gains_them_when_it_is_checked() {
+    let (library_dir, songs) = library("playlist-backfill");
+    let store = common::scratch_dir("playlist-backfill-store");
+    let path = written_without_fingerprints(&store, "Old", &songs);
+
+    let mut playlist = Playlist::load_from(&path).expect("load");
+    let resolution = playlist.resolve_missing(&library_dir);
+
+    assert_eq!(resolution.filled, songs.len(), "every track that is there gained a fingerprint");
+    assert!(resolution.moved.is_empty());
+    assert!(resolution.lost.is_empty());
+    assert!(resolution.any(), "so the caller knows to write the playlist back");
+
+    playlist.save_to(&path).expect("save");
+    assert!(
+        std::fs::read_to_string(&path).expect("read back").contains("[[files]]"),
+        "and the fingerprints are on disk, so this is paid once"
+    );
+
+    // Which is the whole point: an outside move is now followable for a playlist that predates all
+    // of this.
+    let was = songs[0].path().to_path_buf();
+    let now = library_dir.join("moved-by-something-else.wav");
+    std::fs::rename(&was, &now).expect("move the file");
+
+    let mut reloaded = Playlist::load_from(&path).expect("load");
+    assert_eq!(reloaded.resolve_missing(&library_dir).moved, vec![(was, now)]);
+}
+
+#[test]
+fn backfilling_cannot_reach_a_track_that_is_already_gone() {
+    let (library_dir, songs) = library("playlist-backfill-gone");
+    let store = common::scratch_dir("playlist-backfill-gone-store");
+    let path = written_without_fingerprints(&store, "Old", &songs);
+
+    // The file went before this version ever saw the playlist, so there was never anything to
+    // fingerprint: it cannot be searched for, and the listing says so rather than pretending.
+    std::fs::remove_file(songs[1].path()).expect("delete");
+
+    let mut playlist = Playlist::load_from(&path).expect("load");
+    let resolution = playlist.resolve_missing(&library_dir);
+
+    assert_eq!(resolution.filled, songs.len() - 1);
+    assert!(resolution.lost.is_empty(), "it is not searched for, so it is not given up on either");
+    assert!(playlist.is_lost(&songs[1]), "but it is still counted as missing");
+
+    // The rest of the playlist is now protected, which is what could be salvaged.
+    assert_eq!(playlist.len(), songs.len());
+}
+
+#[test]
+fn a_second_check_fingerprints_nothing_again() {
+    let (library_dir, songs) = library("playlist-backfill-once");
+    let store = common::scratch_dir("playlist-backfill-once-store");
+    let path = written_without_fingerprints(&store, "Old", &songs);
+
+    let mut playlist = Playlist::load_from(&path).expect("load");
+    assert_eq!(playlist.resolve_missing(&library_dir).filled, songs.len());
+    assert!(!playlist.resolve_missing(&library_dir).any(), "nothing left to do");
+}
+
+#[test]
+fn a_track_is_only_written_off_for_the_library_that_was_searched() {
+    let (library_dir, songs) = library("playlist-two-roots");
+    let elsewhere = common::scratch_dir("playlist-two-roots-elsewhere");
+
+    let mut playlist = Playlist::with_songs("Spanning", songs.clone());
+
+    // The track moves within its own library, but a different folder is what gets opened — a
+    // second library, or the library pointed somewhere else in the config.
+    let was = songs[0].path().to_path_buf();
+    let now = library_dir.join("tidied-away.wav");
+    std::fs::rename(&was, &now).expect("move the file");
+
+    let wrong_root = playlist.resolve_missing(&elsewhere);
+    assert_eq!(wrong_root.lost, vec![was.clone()], "not there, which says nothing about elsewhere");
+
+    // The real library is still searched when it is opened, rather than the track having been
+    // written off by a sweep of a folder it was never in.
+    let right_root = playlist.resolve_missing(&library_dir);
+    assert_eq!(right_root.moved, vec![(was, now)], "found where it actually went");
+}
+
+#[test]
+fn saving_leaves_nothing_behind_and_never_a_half_written_playlist() {
+    let (_library, songs) = library("playlist-atomic");
+    let dir = common::scratch_dir("playlist-atomic-store");
+
+    let playlist = Playlist::with_songs("Late Night", songs.clone());
+    let path = dir.join(playlist.file_name());
+
+    playlist.save_to(&path).expect("save");
+    playlist.save_to(&path).expect("save again over the top");
+
+    let left: Vec<String> = std::fs::read_dir(&dir)
+        .expect("list")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+
+    assert_eq!(left, ["late_night.toml"], "the file it is written through is renamed, not left");
+
+    // And the playlist a reader sees is always a whole one.
+    assert_eq!(Playlist::load_from(&path).expect("load"), playlist);
 }

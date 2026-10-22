@@ -129,17 +129,29 @@ impl From<toml::ser::Error> for PlaylistError {
 }
 
 /// What is known about one track beyond where it sits, so that it can be found again.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Print {
     /// The fingerprint of the track's audio, from [`crate::fingerprint::of`].
     audio: u128,
-    /// Set once a search for this track has swept the library and come up empty.
+    /// The library roots that have been swept for this track without turning it up.
     ///
     /// A track that was deleted rather than moved is never going to be found, and without this
-    /// every load would hash the whole library again looking for it. The flag is cleared by
-    /// [`Playlist::forget_unresolved`], which is how a search is asked for a second time once the
-    /// file might plausibly be back.
-    unresolved: bool,
+    /// every load would hash the whole library again looking for it. Kept per root rather than as
+    /// one flag because a root that does not hold the track says nothing about one that does: a
+    /// playlist can gather tracks from more than one place, and the library can be pointed
+    /// somewhere else entirely. Writing a track off because it is absent from a folder it was
+    /// never in would be worse than sweeping twice.
+    ///
+    /// Cleared by [`Playlist::forget_unresolved`], which is how a search is asked for again once
+    /// the file might plausibly be back.
+    searched: Vec<PathBuf>,
+}
+
+impl Print {
+    /// A fingerprint nothing has gone looking for yet.
+    fn new(audio: u128) -> Self {
+        Print { audio, searched: Vec::new() }
+    }
 }
 
 /// What a pass of [`Playlist::resolve_missing`] found.
@@ -149,12 +161,18 @@ pub struct Resolution {
     pub moved: Vec<(PathBuf, PathBuf)>,
     /// Tracks that are gone and that a sweep of the library did not turn up.
     pub lost: Vec<PathBuf>,
+    /// Tracks that were still where they should be but had no fingerprint, and now have one.
+    ///
+    /// A playlist written before fingerprints existed holds none, and a track is fingerprinted when
+    /// it is added — so without this, the tracks already in a playlist at the time of the upgrade
+    /// could never be searched for, however many times the playlist was written afterwards.
+    pub filled: usize,
 }
 
 impl Resolution {
     /// Whether anything at all came of the pass, and so whether the playlist needs writing.
     pub fn any(&self) -> bool {
-        !self.moved.is_empty() || !self.lost.is_empty()
+        !self.moved.is_empty() || !self.lost.is_empty() || self.filled > 0
     }
 }
 
@@ -226,9 +244,9 @@ struct OnDiskFile {
     path: String,
     /// The fingerprint of the first megabyte of the track's audio, as hex.
     audio: String,
-    /// Set when the track is gone and a sweep of the library has already failed to find it.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    unresolved: bool,
+    /// The library roots already swept for this track without finding it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    unresolved: Vec<String>,
 }
 
 /// What a track played from the network is called, for the playlist file.
@@ -374,7 +392,7 @@ impl Playlist {
         }
 
         if let Some(audio) = fingerprint::of(song.path()) {
-            self.prints.insert(song.path().to_path_buf(), Print { audio, unresolved: false });
+            self.prints.insert(song.path().to_path_buf(), Print::new(audio));
         }
     }
 
@@ -490,10 +508,14 @@ impl Playlist {
     /// library again for a file that was deleted. [`Playlist::forget_unresolved`] takes the marks
     /// off.
     ///
+    /// Tracks that are present but have no fingerprint get one here, which is what brings a
+    /// playlist written before fingerprints existed up to date: see [`Resolution::filled`]. That
+    /// read happens once, since the fingerprint is then saved with the playlist.
+    ///
     /// The playlist is changed but not saved: the caller decides when to write, and
     /// [`Resolution::any`] says whether there is anything to write.
     pub fn resolve_missing(&mut self, root: &Path) -> Resolution {
-        let mut resolution = Resolution::default();
+        let mut resolution = Resolution { filled: self.fill_prints(), ..Resolution::default() };
 
         // What to look for, by fingerprint. A track with no fingerprint, and one already searched
         // for and not found, are both left exactly as they are.
@@ -510,7 +532,7 @@ impl Playlist {
             }
 
             if let Some(print) = self.prints.get(song.path())
-                && !print.unresolved
+                && !print.searched.iter().any(|swept| swept == root)
             {
                 wanted.entry(print.audio).or_default().push(song.path().to_path_buf());
             }
@@ -559,10 +581,11 @@ impl Playlist {
             }
         }
 
-        // Whatever is left is not under the library root at all.
+        // Whatever is left is not under this library root. It may still be under another, so only
+        // this root is written off for it.
         for was in wanted.into_values().flatten() {
             if let Some(print) = self.prints.get_mut(&was) {
-                print.unresolved = true;
+                print.searched.push(root.to_path_buf());
             }
 
             resolution.lost.push(was);
@@ -574,6 +597,40 @@ impl Playlist {
         resolution
     }
 
+    /// Fingerprint every track that is where the playlist says but has nothing to be found by.
+    ///
+    /// Returns how many gained one. This is the upgrade path: a playlist from before fingerprints
+    /// existed has none at all, and a track can only be fingerprinted while its file is still
+    /// there — which makes the pass over a playlist whose files are present the one chance to do
+    /// it.
+    ///
+    /// A file that is present but cannot be read has nothing to hash and so is tried again on the
+    /// next pass. That is a failed probe on a handful of files rather than a read, and a playlist
+    /// is a short list.
+    fn fill_prints(&mut self) -> usize {
+        // A file listed twice is one read, not two.
+        let mut seen = HashSet::new();
+
+        let missing: Vec<PathBuf> = self
+            .songs
+            .iter()
+            .filter(|song| !song.is_stream() && !self.prints.contains_key(song.path()))
+            .filter(|song| seen.insert(song.path()) && song.path().is_file())
+            .map(|song| song.path().to_path_buf())
+            .collect();
+
+        let mut filled = 0;
+
+        for path in missing {
+            if let Some(audio) = fingerprint::of(&path) {
+                self.prints.insert(path, Print::new(audio));
+                filled += 1;
+            }
+        }
+
+        filled
+    }
+
     /// Let the next [`Playlist::resolve_missing`] search again for tracks it has given up on.
     ///
     /// Returns how many tracks were being skipped.
@@ -581,8 +638,8 @@ impl Playlist {
         let mut forgotten = 0;
 
         for print in self.prints.values_mut() {
-            if print.unresolved {
-                print.unresolved = false;
+            if !print.searched.is_empty() {
+                print.searched.clear();
                 forgotten += 1;
             }
         }
@@ -590,14 +647,13 @@ impl Playlist {
         forgotten
     }
 
-    /// Whether `song`'s file is gone and has already been searched for without being found.
+    /// Whether `song` has no file left to play.
     ///
-    /// What the interface marks a row with, so a track that is listed but cannot be played says so
-    /// rather than failing silently when it is reached.
+    /// What the interface marks a row with: a track that is listed but plays nothing should say so
+    /// rather than being found out when it is reached. Whether it has been searched for does not
+    /// come into it — the file is not there either way.
     pub fn is_lost(&self, song: &Song) -> bool {
-        !song.is_stream()
-            && !song.path().exists()
-            && self.prints.get(song.path()).is_none_or(|print| print.unresolved)
+        !song.is_stream() && !song.path().exists()
     }
 
     // ------------------------------------------------------------------------------ on disk
@@ -662,7 +718,27 @@ impl Playlist {
             files: self.fingerprints(),
         };
 
-        std::fs::write(path, toml::to_string_pretty(&on_disk)?)?;
+        let text = toml::to_string_pretty(&on_disk)?;
+
+        // Written beside the playlist and renamed over it, rather than written in place. A rename
+        // within a directory is atomic, so anything reading the playlist sees either the whole of
+        // the old file or the whole of the new one. Writing in place truncates first, which leaves
+        // a window where the file is empty — and several interfaces can be open on one library,
+        // each of them writing playlists as tracks are added and followed.
+        let temporary = path.with_file_name(format!(
+            "{}.{}.tmp",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            std::process::id()
+        ));
+
+        std::fs::write(&temporary, text)?;
+
+        if let Err(err) = std::fs::rename(&temporary, path) {
+            // Nothing is left lying about in the playlists directory to be listed as a playlist.
+            let _ = std::fs::remove_file(&temporary);
+
+            return Err(err.into());
+        }
 
         Ok(())
     }
@@ -690,8 +766,9 @@ impl Playlist {
             .iter()
             .filter_map(|file| {
                 let audio = fingerprint::from_hex(&file.audio)?;
+                let searched = file.unresolved.iter().map(PathBuf::from).collect();
 
-                Some((PathBuf::from(&file.path), Print { audio, unresolved: file.unresolved }))
+                Some((PathBuf::from(&file.path), Print { audio, searched }))
             })
             .collect();
 
@@ -717,7 +794,11 @@ impl Playlist {
                 Some(OnDiskFile {
                     path: song.uri(),
                     audio: fingerprint::to_hex(print.audio),
-                    unresolved: print.unresolved,
+                    unresolved: print
+                        .searched
+                        .iter()
+                        .map(|root| root.to_string_lossy().into_owned())
+                        .collect(),
                 })
             })
             .collect()

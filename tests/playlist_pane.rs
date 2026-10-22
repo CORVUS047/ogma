@@ -876,3 +876,41 @@ fn opening_a_library_looks_for_tracks_that_moved_while_ogma_was_closed() {
     let saved = Playlist::load_from(&directory.join("rediscovered.toml")).expect("load");
     assert_eq!(saved.as_added()[0].path(), now, "and written back, so it is found once");
 }
+
+#[test]
+fn opening_a_library_brings_a_playlist_from_before_fingerprints_up_to_date() {
+    let directory = redirect();
+
+    let dir = common::scratch_dir("screen-backfill");
+    let track = common::write_wav(
+        &dir,
+        &WavSpec { name: "only.wav", title: Some("Only"), ..WavSpec::default() },
+    );
+
+    // A playlist file as the version before fingerprints wrote one.
+    let path = directory.join("inherited.toml");
+    std::fs::create_dir_all(&directory).expect("make the playlists directory");
+    std::fs::write(
+        &path,
+        format!(
+            "name = \"Inherited\"\nsort = \"manual\"\ndescending = false\ntracks = [\"{}\"]\n",
+            track.display()
+        ),
+    )
+    .expect("write it");
+
+    // Opening the library is the one chance to fingerprint tracks that are still where they say.
+    let _screen = PlayerScreen::browsing(&dir);
+
+    let text = std::fs::read_to_string(&path).expect("read back");
+    assert!(text.contains("[[files]]"), "the playlist now carries fingerprints: {text}");
+
+    // So a move made outside ogma from here on is followable, which it was not before.
+    let now = dir.join("renamed.wav");
+    std::fs::rename(&track, &now).expect("move the file");
+
+    let _again = PlayerScreen::browsing(&dir);
+
+    let saved = Playlist::load_from(&path).expect("load");
+    assert_eq!(saved.as_added()[0].path(), now);
+}
